@@ -304,6 +304,24 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
   }
 
 public:
+  // Codec callbacks run on the worker subset used by process(). These helpers
+  // expose that subset's synchronization without exposing the connection state
+  // machine itself.
+  __device__ __forceinline__ void syncCodecWorkers() {
+    subBarrier();
+  }
+  __device__ __forceinline__ bool anyCodecWorker(int vote) {
+    return subBarrierAny(vote);
+  }
+  __device__ __forceinline__ uint64_t codecRedOpArg() const {
+    return ncclShmem.groups[group].redOpArgs;
+  }
+  __device__ __forceinline__ void* codecScratch() {
+    // The codec is collective over all process() workers, so every worker must
+    // address the same scratch slot rather than its own warp's slot.
+    return ncclScratchForWarp(0);
+  }
+
   static inline __device__ void sendPeerNotify(int peer, int connIndex, int steps) {
     ncclDevChannelPeer* peerPtr = ncclShmem.channel.peers[peer];
     peerPtr->send[connIndex].step += steps;

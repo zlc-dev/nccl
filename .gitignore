@@ -31,3 +31,7 @@ docs/examples/**/rmsnorm_multimem
 docs/examples/**/rmsnorm_gin
 docs/examples/**/rmsnorm_hybrid
 docs/examples/**/ring_exchange
+
+compile_commands.json
+zipccl/
+.clangd

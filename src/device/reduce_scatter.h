@@ -8,6 +8,7 @@
 #include "device.h"
 #include "collectives.h"
 #include "primitives.h"
+#include "reduce_scatter_ring_codec.h"
 
 namespace {
 template <typename T, typename RedOp, typename Proto>
@@ -30,6 +31,8 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
   // coverity[callee_ptr_arith:FALSE]
   Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0> prims(tid, nthreads, &ring->prev, &ring->next, work->sendbuff,
                                                            work->recvbuff, work->redOpArg);
+  using Codec = ReduceScatterRingCodec<T, RedOp, Proto>;
+  chunkCount = Codec::chunkElementLimit(chunkCount);
 
   for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
     nelem = min(chunkCount, channelCount - elemOffset);
@@ -39,19 +42,19 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
     // step 0: push data to next GPU
     rankDest = ringRanks[nranks - 1];
     offset = dataOffset + rankDest * count;
-    prims.send(offset, nelem);
+    Codec::encodeSend(prims, work, offset, nelem);
 
     // k-2 steps: reduce and copy to next GPU
     for (int j = 2; j < nranks; ++j) {
       rankDest = ringRanks[nranks - j];
       offset = dataOffset + rankDest * count;
-      prims.recvReduceSend(offset, nelem);
+      Codec::decodeReduceEncodeSend(prims, work, offset, nelem);
     }
 
     // step k-1: reduce this buffer and data, which will produce the final result
     rankDest = ringRanks[0];
     offset = dataOffset + rankDest * count;
-    prims.recvReduceCopy(offset, dataOffset, nelem, /*postOp=*/true);
+    Codec::decodeReduceCopy(prims, work, offset, dataOffset, nelem, /*postOp=*/true);
   }
 }
 } // namespace
