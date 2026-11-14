@@ -40,12 +40,13 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
   static constexpr int PacksPerGroup = WARP_SIZE;
   static constexpr int ElementsPerGroup = Pack * PacksPerGroup;
   static constexpr int MaxWorkerWarps = NCCL_SIMPLE_MAX_NTHREADS / WARP_SIZE;
+  static constexpr int StageOutliersThreshold = WARP_SIZE;
+  static_assert(ncclShmemScratchWarpSize() >= ElementsPerGroup,
+                "ZipCCL needs one group of outlier staging per worker warp");
 
   struct Scratch {
     float warpSums[MaxWorkerWarps];
     float warpSumSqs[MaxWorkerWarps];
-    int warpOutlierCounts[MaxWorkerWarps];
-    int warpOutlierBases[MaxWorkerWarps];
     float sum;
     float sumSq;
     int exponentBase;
@@ -164,26 +165,13 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     }
     return inclusive - value;
   }
-  template <typename Prims>
   __device__ __forceinline__ static int allocateOutliers(
-      Prims& prims, Scratch* scratch, int tid, int nworkers, int warp, int lane,
-      int localCount, uint32_t* groupOffset) {
+      Scratch* scratch, int lane, int localCount, uint32_t* groupOffset) {
     int prefix = warpExclusivePrefix(localCount);
     int total = __shfl_sync(0xffffffffu, prefix + localCount, WARP_SIZE - 1);
-    if (lane == 0) scratch->warpOutlierCounts[warp] = total;
-    prims.syncCodecWorkers();
-    if (tid == 0) {
-      int base = scratch->outlierCount;
-      int workerWarps = nworkers / WARP_SIZE;
-      for (int w = 0; w < workerWarps; w++) {
-        scratch->warpOutlierBases[w] = base;
-        base += scratch->warpOutlierCounts[w];
-      }
-      scratch->outlierCount = base;
-    }
-    prims.syncCodecWorkers();
-    int base = scratch->warpOutlierBases[warp];
-    if (lane == 0 && groupOffset != nullptr) *groupOffset = uint32_t(base);
+    int base = lane == 0 ? atomicAdd(&scratch->outlierCount, total) : 0;
+    base = __shfl_sync(0xffffffffu, base, 0);
+    if (lane == 0) *groupOffset = uint32_t(base);
     return base + prefix;
   }
   __device__ __forceinline__ static FrameView frameView(const void* encoded, int n) {
@@ -265,14 +253,18 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
   }
   __device__ __forceinline__ static uint16_t decodeElement(
       const FrameView& input, int bit, CodeBitmaps bitmaps, int exponentBase,
-      const uint32_t sm[2], int& outlierCursor) {
+      const uint32_t sm[2], uint8_t outlierMask, int threadOutlierBase,
+      const uint8_t* stagedOutliers, int stagedThreadBase, bool useStagedOutliers) {
     uint32_t code = ((bitmaps.b0 >> bit) & 1u) |
                     (((bitmaps.b1 >> bit) & 1u) << 1) |
                     (((bitmaps.b2 >> bit) & 1u) << 2);
     int exponent;
     if (code == 0) {
-      exponent = int(loadU8(input.outlierExponents + outlierCursor));
-      outlierCursor++;
+      uint32_t maskBefore = (1u << bit) - 1u;
+      int threadOffset = __popc(uint32_t(outlierMask) & maskBefore);
+      exponent = useStagedOutliers
+                   ? int(stagedOutliers[stagedThreadBase + threadOffset])
+                   : int(loadU8(input.outlierExponents + threadOutlierBase + threadOffset));
     } else {
       exponent = exponentBase + int(code) - 1;
     }
@@ -280,26 +272,39 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     return uint16_t((signMantissa & 0x80u) << 8) | uint16_t((exponent & 0xff) << 7) |
            uint16_t(signMantissa & 0x7fu);
   }
-  template <bool StoreSignMantissa>
-  __device__ __forceinline__ static int encodeRegisters(
+  template <bool StoreSignMantissa, bool FullPack>
+  __device__ __forceinline__ static int encodeRegistersImpl(
       const Pack8Registers& values, int count, int exponentBase, uint32_t* sm, CodeBitmaps& bitmaps,
       uint8_t outlierExponents[Pack]) {
     if (StoreSignMantissa) sm[0] = sm[1] = 0;
     bitmaps.b0 = bitmaps.b1 = bitmaps.b2 = 0;
     int outliers = 0;
 #pragma unroll
-    for (int i = 0; i < Pack; i++) if (i < count) {
+    for (int i = 0; i < Pack; i++) if (FullPack || i < count) {
       uint16_t raw = pairElement(values.pair[i / 2], i & 1);
       uint8_t exponent = uint8_t((raw >> 7) & 0xffu);
-      if constexpr (StoreSignMantissa) setSmElement(sm, i, raw);
+      if (StoreSignMantissa) setSmElement(sm, i, raw);
       uint32_t code = exponent >= exponentBase && exponent < exponentBase + 7
                         ? uint32_t(exponent - exponentBase + 1) : 0u;
       bitmaps.b0 |= uint8_t((code & 1u) << i);
       bitmaps.b1 |= uint8_t(((code >> 1) & 1u) << i);
       bitmaps.b2 |= uint8_t(((code >> 2) & 1u) << i);
-      if (code == 0) outlierExponents[outliers++] = exponent;
+      // The candidate slot is always in bounds. A later outlier overwrites any
+      // non-outlier candidate, removing the divergent compaction branch.
+      outlierExponents[outliers] = exponent;
+      outliers += code == 0;
     }
     return outliers;
+  }
+  template <bool StoreSignMantissa>
+  __device__ __forceinline__ static int encodeRegisters(
+      const Pack8Registers& values, int count, int exponentBase, uint32_t* sm, CodeBitmaps& bitmaps,
+      uint8_t outlierExponents[Pack]) {
+    return count == Pack
+             ? encodeRegistersImpl<StoreSignMantissa, true>(
+                 values, count, exponentBase, sm, bitmaps, outlierExponents)
+             : encodeRegistersImpl<StoreSignMantissa, false>(
+                 values, count, exponentBase, sm, bitmaps, outlierExponents);
   }
   template <typename Prims>
   __device__ __forceinline__ static int finishFrame(
@@ -342,25 +347,22 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     uint8_t* outlierStream = bytes + outlierOffset(n);
 
     int warp = tid / WARP_SIZE, lane = tid & (WARP_SIZE - 1), workerWarps = nworkers / WARP_SIZE;
-    int groups = groupCount(n);
-    for (int wave = 0; wave * workerWarps < groups; wave++) {
-      int group = wave * workerWarps + warp;
-      bool active = group < groups;
+    for (int group = warp; group < groupCount(n); group += workerWarps) {
       int pack = group * PacksPerGroup + lane, begin = pack * Pack;
-      int count = active ? min(Pack, max(0, n - begin)) : 0;
+      int count = min(Pack, max(0, n - begin));
       Pack8Registers values = {};
       if (count) loadBf16Pack(input + begin, count, values);
       uint32_t sm[2]; CodeBitmaps bitmaps; uint8_t outliers[Pack];
       int outlierN = encodeRegisters<true>(
         values, count, scratch->exponentBase, sm, bitmaps, outliers);
-      int out = allocateOutliers(
-        prims, scratch, tid, nworkers, warp, lane, outlierN, active ? offsets + group : nullptr);
+      int out = allocateOutliers(scratch, lane, outlierN, offsets + group);
       if (count) {
         storeSignMantissa(smStream + begin, count, sm);
         bitmap0[pack] = bitmaps.b0;
         bitmap1[pack] = bitmaps.b1;
         bitmap2[pack] = bitmaps.b2;
-        for (int i = 0; i < outlierN; i++) outlierStream[out + i] = outliers[i];
+#pragma unroll
+        for (int i = 0; i < Pack; i++) if (i < outlierN) outlierStream[out + i] = outliers[i];
       }
     }
     return finishFrame(prims, scratch, tid, n, encoded, stats, 1);
@@ -394,43 +396,59 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     uint8_t* outlierStream = bytes + outlierOffset(n);
     int inputBase = int(loadU32(reinterpret_cast<const uint32_t*>(input.frame + offsetof(ZipCclRingFrameHeader, exponentBase))));
     int warp = tid / WARP_SIZE, lane = tid & (WARP_SIZE - 1), workerWarps = nworkers / WARP_SIZE;
-    int groups = groupCount(n);
-    for (int wave = 0; wave * workerWarps < groups; wave++) {
-      int group = wave * workerWarps + warp;
-      bool active = group < groups;
+    for (int group = warp; group < groupCount(n); group += workerWarps) {
       int pack = group * PacksPerGroup + lane, begin = pack * Pack;
-      int count = active ? min(Pack, max(0, n - begin)) : 0;
+      int count = min(Pack, max(0, n - begin));
       CodeBitmaps inBitmaps = {count ? loadU8(input.bitmap0 + pack) : uint8_t(0),
                               count ? loadU8(input.bitmap1 + pack) : uint8_t(0),
                               count ? loadU8(input.bitmap2 + pack) : uint8_t(0)};
       uint8_t validMask = count == Pack ? uint8_t(0xffu) : uint8_t((1u << count) - 1u);
+      // Invalid tail elements use code 1, so the fixed-width decode below never
+      // touches the outlier stream for elements that will not be stored.
+      inBitmaps.b0 |= uint8_t(~validMask);
       uint8_t inOutlierMask = uint8_t(~(inBitmaps.b0 | inBitmaps.b1 | inBitmaps.b2)) & validMask;
       int inOutliers = __popc(uint32_t(inOutlierMask));
       int inPrefix = warpExclusivePrefix(inOutliers);
-      int inGroupBase = active ? int(loadU32(input.groupOffsets + group)) : 0;
-      int outlierCursor = inGroupBase + inPrefix;
+      int inGroupBase = int(loadU32(input.groupOffsets + group));
+      int threadOutlierBase = inGroupBase + inPrefix;
+      int groupOutliers = __shfl_sync(0xffffffffu, inPrefix + inOutliers, WARP_SIZE - 1);
+      bool stageOutliers = groupOutliers >= StageOutliersThreshold;
+      uint8_t* stagedOutliers = static_cast<uint8_t*>(prims.codecWarpScratch(warp));
+      if (stageOutliers) {
+#pragma unroll
+        for (int round = 0; round < Pack; round++) {
+          int i = lane + round * WARP_SIZE;
+          if (i < groupOutliers)
+            stagedOutliers[i] = loadU8(input.outlierExponents + inGroupBase + i);
+        }
+        __syncwarp();
+      }
       uint32_t inSm[2] = {}; Pack8Registers result = {};
       if (count) {
-        loadSignMantissa(input.signMantissa + begin, count, inSm); loadBf16Pack(localInput + begin, count, result);
+        loadSignMantissa(input.signMantissa + begin, count, inSm);
+        loadBf16Pack(localInput + begin, count, result);
 #pragma unroll
         for (int pair = 0; pair < 4; pair++) {
-          uint16_t lo = decodeElement(input, pair * 2, inBitmaps, inputBase, inSm, outlierCursor);
-          uint16_t hi = pair * 2 + 1 < count
-                          ? decodeElement(input, pair * 2 + 1, inBitmaps, inputBase, inSm, outlierCursor) : 0;
+          uint16_t lo = decodeElement(
+            input, pair * 2, inBitmaps, inputBase, inSm, inOutlierMask, threadOutlierBase,
+            stagedOutliers, inPrefix, stageOutliers);
+          uint16_t hi = decodeElement(
+            input, pair * 2 + 1, inBitmaps, inputBase, inSm, inOutlierMask, threadOutlierBase,
+            stagedOutliers, inPrefix, stageOutliers);
           result.pair[pair] = addBf16Pair(uint32_t(lo) | (uint32_t(hi) << 16), result.pair[pair]);
         }
       }
       uint32_t outSm[2]; CodeBitmaps outBitmaps; uint8_t outliers[Pack];
       int outlierN = encodeRegisters<true>(
         result, count, scratch->exponentBase, outSm, outBitmaps, outliers);
-      int out = allocateOutliers(
-        prims, scratch, tid, nworkers, warp, lane, outlierN, active ? offsets + group : nullptr);
+      int out = allocateOutliers(scratch, lane, outlierN, offsets + group);
       if (count) {
         storeSignMantissa(smStream + begin, count, outSm);
         bitmap0[pack] = outBitmaps.b0;
         bitmap1[pack] = outBitmaps.b1;
         bitmap2[pack] = outBitmaps.b2;
-        for (int i = 0; i < outlierN; i++) outlierStream[out + i] = outliers[i];
+#pragma unroll
+        for (int i = 0; i < Pack; i++) if (i < outlierN) outlierStream[out + i] = outliers[i];
       }
     }
     return finishFrame(prims, scratch, tid, n, encodedOutput, combined, contributors + 1);
@@ -438,7 +456,7 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
 
   template <typename Prims>
   __device__ __forceinline__ static void decodeReduceCopy(
-      Prims& /*prims*/, int tid, int nworkers, const void* encodedInput, const T* localInput, int n,
+      Prims& prims, int tid, int nworkers, const void* encodedInput, const T* localInput, int n,
       T* output, bool /*postOp*/) {
     FrameView input = frameView(encodedInput, n);
     int inputBase = int(loadU32(reinterpret_cast<const uint32_t*>(input.frame + offsetof(ZipCclRingFrameHeader, exponentBase))));
@@ -450,19 +468,36 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
                             count ? loadU8(input.bitmap1 + pack) : uint8_t(0),
                             count ? loadU8(input.bitmap2 + pack) : uint8_t(0)};
       uint8_t validMask = count == Pack ? uint8_t(0xffu) : uint8_t((1u << count) - 1u);
+      bitmaps.b0 |= uint8_t(~validMask);
       uint8_t inOutlierMask = uint8_t(~(bitmaps.b0 | bitmaps.b1 | bitmaps.b2)) & validMask;
       int inOutliers = __popc(uint32_t(inOutlierMask));
       int inPrefix = warpExclusivePrefix(inOutliers);
       int inGroupBase = int(loadU32(input.groupOffsets + group));
-      int outlierCursor = inGroupBase + inPrefix;
+      int threadOutlierBase = inGroupBase + inPrefix;
+      int groupOutliers = __shfl_sync(0xffffffffu, inPrefix + inOutliers, WARP_SIZE - 1);
+      bool stageOutliers = groupOutliers >= StageOutliersThreshold;
+      uint8_t* stagedOutliers = static_cast<uint8_t*>(prims.codecWarpScratch(warp));
+      if (stageOutliers) {
+#pragma unroll
+        for (int round = 0; round < Pack; round++) {
+          int i = lane + round * WARP_SIZE;
+          if (i < groupOutliers)
+            stagedOutliers[i] = loadU8(input.outlierExponents + inGroupBase + i);
+        }
+        __syncwarp();
+      }
       if (count) {
         uint32_t sm[2]; Pack8Registers result;
-        loadSignMantissa(input.signMantissa + begin, count, sm); loadBf16Pack(localInput + begin, count, result);
+        loadSignMantissa(input.signMantissa + begin, count, sm);
+        loadBf16Pack(localInput + begin, count, result);
 #pragma unroll
         for (int pair = 0; pair < 4; pair++) {
-          uint16_t lo = decodeElement(input, pair * 2, bitmaps, inputBase, sm, outlierCursor);
-          uint16_t hi = pair * 2 + 1 < count
-                          ? decodeElement(input, pair * 2 + 1, bitmaps, inputBase, sm, outlierCursor) : 0;
+          uint16_t lo = decodeElement(
+            input, pair * 2, bitmaps, inputBase, sm, inOutlierMask, threadOutlierBase,
+            stagedOutliers, inPrefix, stageOutliers);
+          uint16_t hi = decodeElement(
+            input, pair * 2 + 1, bitmaps, inputBase, sm, inOutlierMask, threadOutlierBase,
+            stagedOutliers, inPrefix, stageOutliers);
           result.pair[pair] = addBf16Pair(uint32_t(lo) | (uint32_t(hi) << 16), result.pair[pair]);
         }
         storeBf16Pack(output + begin, count, result);

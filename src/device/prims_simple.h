@@ -321,6 +321,11 @@ public:
     // address the same scratch slot rather than its own warp's slot.
     return ncclScratchForWarp(0);
   }
+  __device__ __forceinline__ void* codecWarpScratch(int workerWarp) {
+    // Slot 0 holds CTA-wide codec state. Simple send operations reserve one
+    // control warp, leaving slots [1, nworkers/WARP_SIZE] for worker-local data.
+    return ncclScratchForWarp(workerWarp + 1);
+  }
 
   static inline __device__ void sendPeerNotify(int peer, int connIndex, int steps) {
     ncclDevChannelPeer* peerPtr = ncclShmem.channel.peers[peer];
