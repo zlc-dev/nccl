@@ -8,8 +8,10 @@
 #ifndef NCCL_ZIPCCL_RING_CODEC_H_
 #define NCCL_ZIPCCL_RING_CODEC_H_
 
-// Each Simple-protocol slice is a self-contained frame. Only the first rank
-// scans the data; intermediate ranks update the distribution analytically.
+// Each Simple-protocol slice is a self-contained frame. The first rank scans
+// the complete channel chunk once, then all of its slices reuse that
+// distribution while flowing independently through the ring. Intermediate
+// ranks update the distribution analytically.
 struct alignas(16) ZipCclRingFrameHeader {
   static constexpr uint32_t Magic = 0x5a43434c; // "ZCCL"
   static constexpr uint16_t Version = 5;
@@ -42,6 +44,8 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
   struct Scratch {
     float warpSums[MaxWorkerWarps];
     float warpSumSqs[MaxWorkerWarps];
+    int warpOutlierCounts[MaxWorkerWarps];
+    int warpOutlierBases[MaxWorkerWarps];
     float sum;
     float sumSq;
     int exponentBase;
@@ -160,13 +164,26 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     }
     return inclusive - value;
   }
+  template <typename Prims>
   __device__ __forceinline__ static int allocateOutliers(
-      Scratch* scratch, int lane, int localCount, uint32_t* groupOffset) {
+      Prims& prims, Scratch* scratch, int tid, int nworkers, int warp, int lane,
+      int localCount, uint32_t* groupOffset) {
     int prefix = warpExclusivePrefix(localCount);
     int total = __shfl_sync(0xffffffffu, prefix + localCount, WARP_SIZE - 1);
-    int base = lane == 0 ? atomicAdd(&scratch->outlierCount, total) : 0;
-    base = __shfl_sync(0xffffffffu, base, 0);
-    if (lane == 0) *groupOffset = uint32_t(base);
+    if (lane == 0) scratch->warpOutlierCounts[warp] = total;
+    prims.syncCodecWorkers();
+    if (tid == 0) {
+      int base = scratch->outlierCount;
+      int workerWarps = nworkers / WARP_SIZE;
+      for (int w = 0; w < workerWarps; w++) {
+        scratch->warpOutlierBases[w] = base;
+        base += scratch->warpOutlierCounts[w];
+      }
+      scratch->outlierCount = base;
+    }
+    prims.syncCodecWorkers();
+    int base = scratch->warpOutlierBases[warp];
+    if (lane == 0 && groupOffset != nullptr) *groupOffset = uint32_t(base);
     return base + prefix;
   }
   __device__ __forceinline__ static FrameView frameView(const void* encoded, int n) {
@@ -185,23 +202,20 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
 
   template <typename Prims>
   __device__ __forceinline__ static Statistics calculateStatistics(
-      int tid, int nworkers, const T* input, int n, uint8_t* signMantissa, Prims& prims) {
+      int tid, int nworkers, const T* input, int n, Prims& prims) {
     Scratch* scratch = reinterpret_cast<Scratch*>(prims.codecScratch());
     float localSum = 0.0f, localSumSq = 0.0f;
     for (int begin = tid * Pack; begin < n; begin += nworkers * Pack) {
       int count = min(Pack, n - begin);
       Pack8Registers pack;
       loadBf16Pack(input + begin, count, pack);
-      uint32_t sm[2] = {};
 #pragma unroll
       for (int i = 0; i < Pack; i++) if (i < count) {
         uint16_t raw = pairElement(pack.pair[i / 2], i & 1);
         float value = __bfloat162float(__ushort_as_bfloat16(raw));
         localSum += value;
         localSumSq = fmaf(value, value, localSumSq);
-        setSmElement(sm, i, raw);
       }
-      storeSignMantissa(signMantissa + begin, count, sm);
     }
 #pragma unroll
     for (int delta = WARP_SIZE / 2; delta != 0; delta >>= 1) {
@@ -223,6 +237,13 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
       scratch->sumSq = sumSq;
     }
     prims.syncCodecWorkers();
+    Statistics stats;
+    float inverseCount = n == 0 ? 0.0f : 1.0f / float(n);
+    stats.mean = scratch->sum * inverseCount;
+    stats.variance = fmaxf(0.0f, scratch->sumSq * inverseCount - stats.mean * stats.mean);
+    return stats;
+  }
+  __device__ __forceinline__ static Statistics cachedStatistics(const Scratch* scratch, int n) {
     Statistics stats;
     float inverseCount = n == 0 ? 0.0f : 1.0f / float(n);
     stats.mean = scratch->sum * inverseCount;
@@ -270,7 +291,7 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     for (int i = 0; i < Pack; i++) if (i < count) {
       uint16_t raw = pairElement(values.pair[i / 2], i & 1);
       uint8_t exponent = uint8_t((raw >> 7) & 0xffu);
-      if (StoreSignMantissa) setSmElement(sm, i, raw);
+      if constexpr (StoreSignMantissa) setSmElement(sm, i, raw);
       uint32_t code = exponent >= exponentBase && exponent < exponentBase + 7
                         ? uint32_t(exponent - exponentBase + 1) : 0u;
       bitmaps.b0 |= uint8_t((code & 1u) << i);
@@ -302,9 +323,13 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
 
   template <typename Prims>
   __device__ __forceinline__ static int encode(
-      Prims& prims, int tid, int nworkers, const T* input, int n, void* encoded, int capacity) {
+      Prims& prims, int tid, int nworkers, const T* input, int n, void* encoded, int capacity,
+      Statistics stats) {
     Scratch* scratch = reinterpret_cast<Scratch*>(prims.codecScratch());
-    if (tid == 0) { scratch->outlierCount = 0; scratch->frameBytes = 0; scratch->valid = worstFrameBytes(n) <= capacity; }
+    if (tid == 0) {
+      scratch->outlierCount = 0; scratch->frameBytes = 0; scratch->valid = worstFrameBytes(n) <= capacity;
+      scratch->exponentBase = selectExponentBase(stats);
+    }
     prims.syncCodecWorkers();
     if (!scratch->valid) return 0;
     uint8_t* bytes = static_cast<uint8_t*>(encoded);
@@ -316,21 +341,22 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     uint32_t* offsets = reinterpret_cast<uint32_t*>(bytes + groupOffsetOffset(n));
     uint8_t* outlierStream = bytes + outlierOffset(n);
 
-    Statistics stats = calculateStatistics(tid, nworkers, input, n, smStream, prims);
-    if (tid == 0) scratch->exponentBase = selectExponentBase(stats);
-    prims.syncCodecWorkers();
-
     int warp = tid / WARP_SIZE, lane = tid & (WARP_SIZE - 1), workerWarps = nworkers / WARP_SIZE;
-    for (int group = warp; group < groupCount(n); group += workerWarps) {
+    int groups = groupCount(n);
+    for (int wave = 0; wave * workerWarps < groups; wave++) {
+      int group = wave * workerWarps + warp;
+      bool active = group < groups;
       int pack = group * PacksPerGroup + lane, begin = pack * Pack;
-      int count = min(Pack, max(0, n - begin));
+      int count = active ? min(Pack, max(0, n - begin)) : 0;
       Pack8Registers values = {};
       if (count) loadBf16Pack(input + begin, count, values);
-      CodeBitmaps bitmaps; uint8_t outliers[Pack];
-      int outlierN = encodeRegisters<false>(
-        values, count, scratch->exponentBase, nullptr, bitmaps, outliers);
-      int out = allocateOutliers(scratch, lane, outlierN, offsets + group);
+      uint32_t sm[2]; CodeBitmaps bitmaps; uint8_t outliers[Pack];
+      int outlierN = encodeRegisters<true>(
+        values, count, scratch->exponentBase, sm, bitmaps, outliers);
+      int out = allocateOutliers(
+        prims, scratch, tid, nworkers, warp, lane, outlierN, active ? offsets + group : nullptr);
       if (count) {
+        storeSignMantissa(smStream + begin, count, sm);
         bitmap0[pack] = bitmaps.b0;
         bitmap1[pack] = bitmaps.b1;
         bitmap2[pack] = bitmaps.b2;
@@ -368,9 +394,12 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     uint8_t* outlierStream = bytes + outlierOffset(n);
     int inputBase = int(loadU32(reinterpret_cast<const uint32_t*>(input.frame + offsetof(ZipCclRingFrameHeader, exponentBase))));
     int warp = tid / WARP_SIZE, lane = tid & (WARP_SIZE - 1), workerWarps = nworkers / WARP_SIZE;
-    for (int group = warp; group < groupCount(n); group += workerWarps) {
+    int groups = groupCount(n);
+    for (int wave = 0; wave * workerWarps < groups; wave++) {
+      int group = wave * workerWarps + warp;
+      bool active = group < groups;
       int pack = group * PacksPerGroup + lane, begin = pack * Pack;
-      int count = min(Pack, max(0, n - begin));
+      int count = active ? min(Pack, max(0, n - begin)) : 0;
       CodeBitmaps inBitmaps = {count ? loadU8(input.bitmap0 + pack) : uint8_t(0),
                               count ? loadU8(input.bitmap1 + pack) : uint8_t(0),
                               count ? loadU8(input.bitmap2 + pack) : uint8_t(0)};
@@ -378,23 +407,24 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
       uint8_t inOutlierMask = uint8_t(~(inBitmaps.b0 | inBitmaps.b1 | inBitmaps.b2)) & validMask;
       int inOutliers = __popc(uint32_t(inOutlierMask));
       int inPrefix = warpExclusivePrefix(inOutliers);
-      int inGroupBase = int(loadU32(input.groupOffsets + group));
+      int inGroupBase = active ? int(loadU32(input.groupOffsets + group)) : 0;
       int outlierCursor = inGroupBase + inPrefix;
-      uint32_t inSm[2] = {}; Pack8Registers local = {}, result = {};
+      uint32_t inSm[2] = {}; Pack8Registers result = {};
       if (count) {
-        loadSignMantissa(input.signMantissa + begin, count, inSm); loadBf16Pack(localInput + begin, count, local);
+        loadSignMantissa(input.signMantissa + begin, count, inSm); loadBf16Pack(localInput + begin, count, result);
 #pragma unroll
         for (int pair = 0; pair < 4; pair++) {
           uint16_t lo = decodeElement(input, pair * 2, inBitmaps, inputBase, inSm, outlierCursor);
           uint16_t hi = pair * 2 + 1 < count
                           ? decodeElement(input, pair * 2 + 1, inBitmaps, inputBase, inSm, outlierCursor) : 0;
-          result.pair[pair] = addBf16Pair(uint32_t(lo) | (uint32_t(hi) << 16), local.pair[pair]);
+          result.pair[pair] = addBf16Pair(uint32_t(lo) | (uint32_t(hi) << 16), result.pair[pair]);
         }
       }
       uint32_t outSm[2]; CodeBitmaps outBitmaps; uint8_t outliers[Pack];
       int outlierN = encodeRegisters<true>(
         result, count, scratch->exponentBase, outSm, outBitmaps, outliers);
-      int out = allocateOutliers(scratch, lane, outlierN, offsets + group);
+      int out = allocateOutliers(
+        prims, scratch, tid, nworkers, warp, lane, outlierN, active ? offsets + group : nullptr);
       if (count) {
         storeSignMantissa(smStream + begin, count, outSm);
         bitmap0[pack] = outBitmaps.b0;
@@ -426,14 +456,14 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
       int inGroupBase = int(loadU32(input.groupOffsets + group));
       int outlierCursor = inGroupBase + inPrefix;
       if (count) {
-        uint32_t sm[2]; Pack8Registers local, result = {};
-        loadSignMantissa(input.signMantissa + begin, count, sm); loadBf16Pack(localInput + begin, count, local);
+        uint32_t sm[2]; Pack8Registers result;
+        loadSignMantissa(input.signMantissa + begin, count, sm); loadBf16Pack(localInput + begin, count, result);
 #pragma unroll
         for (int pair = 0; pair < 4; pair++) {
           uint16_t lo = decodeElement(input, pair * 2, bitmaps, inputBase, sm, outlierCursor);
           uint16_t hi = pair * 2 + 1 < count
                           ? decodeElement(input, pair * 2 + 1, bitmaps, inputBase, sm, outlierCursor) : 0;
-          result.pair[pair] = addBf16Pair(uint32_t(lo) | (uint32_t(hi) << 16), local.pair[pair]);
+          result.pair[pair] = addBf16Pair(uint32_t(lo) | (uint32_t(hi) << 16), result.pair[pair]);
         }
         storeBf16Pack(output + begin, count, result);
       }
@@ -463,10 +493,20 @@ struct ZipCclRingProcess {
     int sliceBeg = int((int64_t(eltN) * slice) / Slices);
     int sliceEnd = int((int64_t(eltN) * (slice + 1)) / Slices);
     int sliceN = sliceEnd - sliceBeg, payloadBytes = 0;
-    const T* local = static_cast<const T*>(work->sendbuff) + inpIx + sliceBeg;
-    if (Stage == 0 && nDsts)
-      payloadBytes = Algorithm::encode(*prims, tid, nworkers, local, sliceN, dstPtrs[0], maxSliceElts * int(sizeof(T)));
-    else if (Stage == 1 && nSrcs && nDsts)
+    const T* chunkLocal = static_cast<const T*>(work->sendbuff) + inpIx;
+    const T* local = chunkLocal + sliceBeg;
+    if (Stage == 0 && nDsts) {
+      // process() invokes slices serially within a channel CTA. Scan the whole
+      // chunk once before slice 0, then reuse the cached moments for every
+      // independently framed slice sent into the ReduceScatter pipeline.
+      typename Algorithm::Scratch* scratch =
+        reinterpret_cast<typename Algorithm::Scratch*>(prims->codecScratch());
+      typename Algorithm::Statistics stats = slice == 0
+        ? Algorithm::calculateStatistics(tid, nworkers, chunkLocal, eltN, *prims)
+        : Algorithm::cachedStatistics(scratch, eltN);
+      payloadBytes = Algorithm::encode(
+        *prims, tid, nworkers, local, sliceN, dstPtrs[0], maxSliceElts * int(sizeof(T)), stats);
+    } else if (Stage == 1 && nSrcs && nDsts)
       payloadBytes = Algorithm::decodeReduceEncode(
         *prims, tid, nworkers, srcPtrs[0], local, sliceN, dstPtrs[0], maxSliceElts * int(sizeof(T)));
     else if (Stage == 2 && nSrcs) {
