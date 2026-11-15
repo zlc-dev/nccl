@@ -49,7 +49,6 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     float sum;
     float sumSq;
     int exponentBase;
-    int outlierCount;
     int frameBytes;
     int valid;
   };
@@ -62,7 +61,6 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     const uint32_t* bitmap0;
     const uint32_t* bitmap1;
     const uint32_t* bitmap2;
-    const uint32_t* groupOffsets;
     const uint8_t* outlierExponents;
   };
   struct PackRegisters { uint32_t pair[PairsPerPack]; };
@@ -82,11 +80,8 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
   __device__ __forceinline__ static int payloadEndOffset(int n) {
     return bitmapOffset(n) + bitmapBytes(n) * 3;
   }
-  __device__ __forceinline__ static int groupOffsetOffset(int n) {
-    return payloadEndOffset(n);
-  }
   __device__ __forceinline__ static int outlierOffset(int n) {
-    return groupOffsetOffset(n) + groupCount(n) * int(sizeof(uint32_t));
+    return payloadEndOffset(n);
   }
   __device__ __forceinline__ static int worstFrameBytes(int n) {
     return alignUp(outlierOffset(n) + n, int(sizeof(T)));
@@ -227,15 +222,6 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     __nv_bfloat162 result = __hadd2(a, b);
     return *reinterpret_cast<uint32_t*>(&result);
   }
-  __device__ __forceinline__ static int warpExclusivePrefix(int value, int lane) {
-    int inclusive = value;
-#pragma unroll
-    for (int delta = 1; delta < WARP_SIZE; delta <<= 1) {
-      int preceding = __shfl_up_sync(0xffffffffu, inclusive, delta);
-      if (lane >= delta) inclusive += preceding;
-    }
-    return inclusive - value;
-  }
   __device__ __forceinline__ static FrameView frameView(const void* encoded, int n) {
     FrameView v;
     const uint8_t* bytes = static_cast<const uint8_t*>(encoded);
@@ -245,7 +231,6 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     v.bitmap0 = reinterpret_cast<const uint32_t*>(bytes + bitmapOffset(n));
     v.bitmap1 = reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(v.bitmap0) + bitmapN);
     v.bitmap2 = reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(v.bitmap1) + bitmapN);
-    v.groupOffsets = reinterpret_cast<const uint32_t*>(bytes + groupOffsetOffset(n));
     v.outlierExponents = bytes + outlierOffset(n);
     return v;
   }
@@ -376,37 +361,24 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     }
   }
 
-  __device__ __forceinline__ static void writeOutliers(
-      Scratch* scratch, int lane, int group, uint32_t validMask,
-      const PackRegisters& values, CodeBitmaps bitmaps,
-      uint32_t* groupOffsets, uint8_t* outlierStream) {
+  __device__ __forceinline__ static void writeFixedOutliers(
+      int begin, uint32_t validMask, const PackRegisters& values,
+      CodeBitmaps bitmaps, uint8_t* outlierStream) {
     uint32_t outlierMask = ~(bitmaps.b0 | bitmaps.b1 | bitmaps.b2) & validMask;
-    int threadOutliers = __popc(outlierMask);
-
-    // Fixed streams must be visible before the group writes its variable stream.
-    __syncwarp();
-    int threadPrefix = warpExclusivePrefix(threadOutliers, lane);
-    int groupOutliers = __shfl_sync(
-      0xffffffffu, threadPrefix + threadOutliers, WARP_SIZE - 1);
-    int groupBase = lane == 0 ? atomicAdd(&scratch->outlierCount, groupOutliers) : 0;
-    groupBase = __shfl_sync(0xffffffffu, groupBase, 0);
-    if (lane == 0) groupOffsets[group] = uint32_t(groupBase);
-
-    int outputIndex = groupBase + threadPrefix;
     while (outlierMask) {
       int bit = __ffs(outlierMask) - 1;
       uint16_t raw = pairElement(values.pair[bit / 2], bit & 1);
-      outlierStream[outputIndex++] = uint8_t((raw >> 7) & 0xffu);
+      outlierStream[begin + bit] = uint8_t((raw >> 7) & 0xffu);
       outlierMask &= outlierMask - 1;
     }
   }
 
   template <bool FullGroup>
   __device__ __forceinline__ static void decodeReduceEncodeGroup(
-      Scratch* scratch, const FrameView& input, const T* localInput, int n, int group,
+      const FrameView& input, const T* localInput, int n, int group,
       int lane, int inputBase, int outputBase, uint8_t* smStream,
       uint32_t* bitmap0, uint32_t* bitmap1, uint32_t* bitmap2,
-      uint32_t* groupOffsets, uint8_t* outlierStream) {
+      uint8_t* outlierStream) {
     int pack = group * PacksPerGroup + lane;
     int begin = pack * Pack;
     int count = FullGroup ? Pack : min(Pack, max(0, n - begin));
@@ -424,8 +396,6 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     }
 
     uint32_t inputOutlierMask = ~(bitmaps.b0 | bitmaps.b1 | bitmaps.b2) & validMask;
-    int inputOutliers = __popc(inputOutlierMask);
-    int inputGroupBase = lane == 0 ? int(loadU32(input.groupOffsets + group)) : 0;
 
     uint32_t outputSm[WordsPerSignMantissa];
     if (FullGroup || count) {
@@ -435,12 +405,9 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
       encodeNonOutliersImpl<FullGroup>(result, count, outputBase, outputSm, bitmaps);
     }
 
-    int inputPrefix = warpExclusivePrefix(inputOutliers, lane);
-    inputGroupBase = __shfl_sync(0xffffffffu, inputGroupBase, 0);
-    int inputIndex = inputGroupBase + inputPrefix;
     while (inputOutlierMask) {
       int bit = __ffs(inputOutlierMask) - 1;
-      uint8_t exponent = loadU8(input.outlierExponents + inputIndex++);
+      uint8_t exponent = loadU8(input.outlierExponents + begin + bit);
       uint16_t reducedRaw = reduceOutlierElement(exponent, sm, bit, local);
       replacePackElement(result, bit, reducedRaw);
       replaceSmElement(outputSm, bit, reducedRaw);
@@ -454,8 +421,7 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
       bitmap1[pack] = bitmaps.b1;
       bitmap2[pack] = bitmaps.b2;
     }
-    writeOutliers(
-      scratch, lane, group, validMask, result, bitmaps, groupOffsets, outlierStream);
+    writeFixedOutliers(begin, validMask, result, bitmaps, outlierStream);
   }
 
   template <bool FullGroup>
@@ -479,19 +445,14 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     }
 
     uint32_t inputOutlierMask = ~(bitmaps.b0 | bitmaps.b1 | bitmaps.b2) & validMask;
-    int inputOutliers = __popc(inputOutlierMask);
-    int inputPrefix = warpExclusivePrefix(inputOutliers, lane);
-    int inputGroupBase = lane == 0 ? int(loadU32(input.groupOffsets + group)) : 0;
-    inputGroupBase = __shfl_sync(0xffffffffu, inputGroupBase, 0);
 
     if (FullGroup || count)
       decodeReduceNonOutliersPackImpl<FullGroup>(
         count, bitmaps, inputBase, sm, local, result);
 
-    int inputIndex = inputGroupBase + inputPrefix;
     while (inputOutlierMask) {
       int bit = __ffs(inputOutlierMask) - 1;
-      uint8_t exponent = loadU8(input.outlierExponents + inputIndex++);
+      uint8_t exponent = loadU8(input.outlierExponents + begin + bit);
       replacePackElement(
         result, bit, reduceOutlierElement(exponent, sm, bit, local));
       inputOutlierMask &= inputOutlierMask - 1;
@@ -507,12 +468,12 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
       Statistics stats, uint32_t contributors) {
     prims.syncCodecWorkers();
     if (tid == 0) {
-      int bytes = alignUp(outlierOffset(n) + scratch->outlierCount, int(sizeof(T)));
+      int bytes = alignUp(outlierOffset(n) + n, int(sizeof(T)));
       ZipCclRingFrameHeader* h = reinterpret_cast<ZipCclRingFrameHeader*>(encoded);
       h->magic = ZipCclRingFrameHeader::Magic; h->version = ZipCclRingFrameHeader::Version;
       h->headerBytes = sizeof(ZipCclRingFrameHeader); h->elementCount = n; h->frameBytes = bytes;
       h->exponentBase = scratch->exponentBase; h->groupCount = groupCount(n);
-      h->outlierCount = scratch->outlierCount; h->contributorCount = contributors;
+      h->outlierCount = n; h->contributorCount = contributors;
       h->mean = stats.mean; h->variance = stats.variance;
       h->reserved[0] = h->reserved[1] = 0; scratch->frameBytes = bytes;
     }
@@ -527,7 +488,7 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
       Statistics stats) {
     Scratch* scratch = reinterpret_cast<Scratch*>(prims.codecScratch());
     if (tid == 0) {
-      scratch->outlierCount = 0; scratch->frameBytes = 0;
+      scratch->frameBytes = 0;
       scratch->valid = worstFrameBytes(n) <= capacity;
       scratch->exponentBase = selectExponentBase(stats);
     }
@@ -539,7 +500,6 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     uint32_t* bitmap0 = reinterpret_cast<uint32_t*>(bytes + bitmapOffset(n));
     uint32_t* bitmap1 = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(bitmap0) + bitmapN);
     uint32_t* bitmap2 = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(bitmap1) + bitmapN);
-    uint32_t* groupOffsets = reinterpret_cast<uint32_t*>(bytes + groupOffsetOffset(n));
     uint8_t* outlierStream = bytes + outlierOffset(n);
 
     int warp = tid / WARP_SIZE, lane = tid & (WARP_SIZE - 1), workerWarps = nworkers / WARP_SIZE;
@@ -559,8 +519,7 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
       }
 
       uint32_t validMask = count == Pack ? 0xffffffffu : (1u << count) - 1u;
-      writeOutliers(
-        scratch, lane, group, validMask, values, bitmaps, groupOffsets, outlierStream);
+      writeFixedOutliers(begin, validMask, values, bitmaps, outlierStream);
     }
 
     return finishFrame(prims, scratch, tid, n, encoded, stats, 1);
@@ -578,7 +537,7 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
                            loadFloat(&header->variance) * growth};
     Scratch* scratch = reinterpret_cast<Scratch*>(prims.codecScratch());
     if (tid == 0) {
-      scratch->outlierCount = 0; scratch->frameBytes = 0;
+      scratch->frameBytes = 0;
       scratch->valid = worstFrameBytes(n) <= capacity;
       scratch->exponentBase = selectExponentBase(combined);
     }
@@ -591,22 +550,21 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
     uint32_t* bitmap0 = reinterpret_cast<uint32_t*>(bytes + bitmapOffset(n));
     uint32_t* bitmap1 = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(bitmap0) + bitmapN);
     uint32_t* bitmap2 = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(bitmap1) + bitmapN);
-    uint32_t* groupOffsets = reinterpret_cast<uint32_t*>(bytes + groupOffsetOffset(n));
     uint8_t* outlierStream = bytes + outlierOffset(n);
     int inputBase = int(loadU32(reinterpret_cast<const uint32_t*>(input.frame + offsetof(ZipCclRingFrameHeader, exponentBase))));
     int warp = tid / WARP_SIZE, lane = tid & (WARP_SIZE - 1), workerWarps = nworkers / WARP_SIZE;
     int fullGroups = n / ElementsPerGroup;
     for (int group = warp; group < fullGroups; group += workerWarps) {
       decodeReduceEncodeGroup<true>(
-        scratch, input, localInput, n, group, lane, inputBase, scratch->exponentBase,
-        smStream, bitmap0, bitmap1, bitmap2, groupOffsets, outlierStream);
+        input, localInput, n, group, lane, inputBase, scratch->exponentBase,
+        smStream, bitmap0, bitmap1, bitmap2, outlierStream);
     }
 
     int tailN = n - fullGroups * ElementsPerGroup;
     if (tailN && warp == fullGroups % workerWarps) {
       decodeReduceEncodeGroup<false>(
-        scratch, input, localInput, n, fullGroups, lane, inputBase, scratch->exponentBase,
-        smStream, bitmap0, bitmap1, bitmap2, groupOffsets, outlierStream);
+        input, localInput, n, fullGroups, lane, inputBase, scratch->exponentBase,
+        smStream, bitmap0, bitmap1, bitmap2, outlierStream);
     }
     return finishFrame(prims, scratch, tid, n, encodedOutput, combined, contributors + 1);
   }
@@ -633,8 +591,8 @@ struct ZipCclRingAlgorithm<__nv_bfloat16, FuncSum<__nv_bfloat16>, Unroll> {
 
   __device__ __forceinline__ static size_t maxChunkElements(size_t transportChunkElements, int nSlices) {
     size_t capacity = transportChunkElements * sizeof(T) / nSlices;
-    // Sign/mantissa, three bitmap bits, a worst-case outlier byte, and group
-    // offsets fit under this conservative 153/64-byte bound per element.
+    // Sign/mantissa, three bitmap bits, and one fixed outlier byte per element
+    // fit under this conservative 153/64-byte bound.
     size_t n = capacity > sizeof(ZipCclRingFrameHeader) + 32
                  ? (capacity - sizeof(ZipCclRingFrameHeader) - 32) * 64 / 153 : 0;
     while (n && size_t(worstFrameBytes(int(n))) > capacity) n--;
