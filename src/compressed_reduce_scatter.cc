@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <new>
 #include <thread>
@@ -66,6 +68,20 @@ static ncclResult_t record(cudaEvent_t e, cudaStream_t s) {
   CUDACHECK(cudaEventRecord(e, s));
   return ncclSuccess;
 }
+
+static bool traceEnabled() {
+  static bool enabled = std::getenv("NCCL_COMPRESSED_RS_TRACE") != nullptr;
+  return enabled;
+}
+
+static void trace(const Operation* op, const char* phase) {
+  if (traceEnabled()) {
+    std::fprintf(stderr, "compressed-rs rank=%d sequence=%llu phase=%s\n",
+                 op->comm ? op->comm->rank : -1,
+                 static_cast<unsigned long long>(op->sequence), phase);
+    std::fflush(stderr);
+  }
+}
 static ncclResult_t wait(cudaStream_t s, cudaEvent_t e) {
   CUDACHECK(cudaStreamWaitEvent(s, e, 0));
   return ncclSuccess;
@@ -93,10 +109,16 @@ static ncclResult_t claim(ncclComm* comm, Operation* op) {
   {
     std::lock_guard<std::mutex> lock(m->mutex);
     if (m->cleanup.joinable()) finished = std::move(m->cleanup);
+    else if (m->active.load(std::memory_order_acquire)) {
+      // Another host thread is still submitting this rank's current operation.
+      // Calls serialized by the rank's normal API thread always have a cleanup
+      // thread here and are queued by joining it below.
+      WARN("ncclReduceScatterCompressed: concurrent submissions from multiple host threads are unsupported");
+      return ncclInvalidUsage;
+    }
   }
   if (finished.joinable()) finished.join();
   std::lock_guard<std::mutex> lock(m->mutex);
-  if (m->active.load(std::memory_order_acquire)) return ncclInvalidUsage;
   if (m->cleanupResult != ncclSuccess) return m->cleanupResult;
   m->active.store(true, std::memory_order_release);
   op->comm = comm;
@@ -110,18 +132,22 @@ static ncclResult_t release(Operation* op, bool waitGpu) {
   int savedDev = -1;
   CUDACHECKGOTO(cudaGetDevice(&savedDev), ret, done);
   CUDACHECKGOTO(cudaSetDevice(op->comm->cudaDev), ret, done);
+  trace(op, "cleanup-wait-gpu");
   if (waitGpu && op->complete) CUDACHECKGOTO(cudaEventSynchronize(op->complete), ret, done);
+  trace(op, "cleanup-gpu-done");
   if (op->remoteRx) {
     CUDACHECKGOTO(cudaIpcCloseMemHandle(op->remoteRx), ret, done);
     op->remoteRx = nullptr;
   }
   if (op->exchanged && op->comm->nRanks > 1) {
-    uint64_t ack = op->sequence;
     int tag = CleanupTagBase | static_cast<int>(op->sequence & 0xffff);
-    NCCLCHECKGOTO(bootstrapSend(op->comm->bootstrap, op->comm->channels[0].ring.next,
-                                tag, &ack, sizeof(ack)), ret, done);
-    NCCLCHECKGOTO(bootstrapRecv(op->comm->bootstrap, op->comm->channels[0].ring.prev,
-                                tag, &ack, sizeof(ack)), ret, done);
+    // Every imported next-rank mapping must be closed before any rank frees its
+    // exported RX allocation. The barrier also separates cleanup traffic from
+    // the following operation's endpoint all-gather on the bootstrap state.
+    trace(op, "cleanup-barrier-enter");
+    NCCLCHECKGOTO(bootstrapBarrier(op->comm->bootstrap, op->comm->rank,
+                                   op->comm->nRanks, tag), ret, done);
+    trace(op, "cleanup-barrier-exit");
   }
 done:
   if (op->complete) CUDACHECKIGNORE(cudaEventDestroy(op->complete));
@@ -129,6 +155,7 @@ done:
   if (op->tx) CUDACHECKIGNORE(cudaFree(op->tx));
   if (op->rx) CUDACHECKIGNORE(cudaFree(op->rx));
   if (savedDev >= 0) CUDACHECKIGNORE(cudaSetDevice(savedDev));
+  trace(op, "cleanup-released");
   return ret;
 }
 
@@ -158,6 +185,7 @@ static ncclResult_t allocateExchange(Operation* op, size_t capacity) {
     WARN("ncclReduceScatterCompressed: no direct P2P access from rank %d to %d", comm->rank, next);
     return ncclInvalidUsage;
   }
+  trace(op, "exchange-allocate");
   CUDACHECKGOTO(cudaMalloc(&op->tx, bytes), ret, fail);
   CUDACHECKGOTO(cudaMalloc(&op->rx, bytes), ret, fail);
   CUDACHECKGOTO(cudaMalloc(&op->tasks, sizeof(*op->tasks) * NCCL_COMPRESSED_PIPELINE_DEPTH), ret, fail);
@@ -167,6 +195,7 @@ static ncclResult_t allocateExchange(Operation* op, size_t capacity) {
   CUDACHECKGOTO(cudaIpcOpenMemHandle(&op->remoteRx, handles[next],
                                      cudaIpcMemLazyEnablePeerAccess), ret, fail);
   op->exchanged = true;
+  trace(op, "exchange-ready");
 fail:
   return ret;
 }
@@ -177,6 +206,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
   cudaEvent_t ready[2] = {}, done[2] = {};
   bool acquired = false;
   ncclComm* comm = j->comm;
+  trace(op, "enqueue-begin");
   NCCLCHECKGOTO(ncclStrongStreamAcquire(ncclCudaGraphNone(comm->config.graphUsageMode),
       &comm->sharedRes->deviceStream, false, &cs), ret, fail);
   acquired = true;
@@ -247,6 +277,7 @@ fail:
     if(ready[i]) CUDACHECKIGNORE(cudaEventDestroy(ready[i]));
     if(done[i]) CUDACHECKIGNORE(cudaEventDestroy(done[i]));
   }
+  trace(op, ret == ncclSuccess ? "enqueue-end" : "enqueue-error");
   return ret;
 }
 

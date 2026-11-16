@@ -38,6 +38,33 @@ namespace {
 constexpr size_t BlockElements = 131072;
 constexpr int Threads = 256;
 
+struct RankResult {
+  float timeUs;
+  int errors;
+};
+
+bool writeAll(int fd, const void* data, size_t bytes) {
+  const char* p = static_cast<const char*>(data);
+  while (bytes != 0) {
+    ssize_t n = write(fd, p, bytes);
+    if (n <= 0) return false;
+    p += n;
+    bytes -= static_cast<size_t>(n);
+  }
+  return true;
+}
+
+bool readAll(int fd, void* data, size_t bytes) {
+  char* p = static_cast<char*>(data);
+  while (bytes != 0) {
+    ssize_t n = read(fd, p, bytes);
+    if (n <= 0) return false;
+    p += n;
+    bytes -= static_cast<size_t>(n);
+  }
+  return true;
+}
+
 __global__ void fillInput(float* data, size_t recvcount, int nranks, int sourceRank) {
   size_t total = recvcount * static_cast<size_t>(nranks);
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -167,7 +194,8 @@ size_t parseBytes(const char* text) {
 }
 
 int runRank(int rank, int nranks, const ncclUniqueId& id, size_t minBytes,
-            size_t maxBytes, int stepFactor, int warmupIters, int iters) {
+            size_t maxBytes, int stepFactor, int warmupIters, int iters,
+            int resultFd, int releaseFd) {
   CUDACHECK(cudaSetDevice(rank));
   ncclComm_t comm;
   cudaStream_t stream;
@@ -191,37 +219,17 @@ int runRank(int rank, int nranks, const ncclUniqueId& id, size_t minBytes,
   cudaEvent_t start, stop;
   CUDACHECK(cudaEventCreate(&start));
   CUDACHECK(cudaEventCreate(&stop));
-  float* deviceTime = nullptr;
-  float* deviceMaxTime = nullptr;
-  int* deviceErrors = nullptr;
-  int* deviceTotalErrors = nullptr;
-  CUDACHECK(cudaMalloc(&deviceTime, sizeof(float)));
-  CUDACHECK(cudaMalloc(&deviceMaxTime, sizeof(float)));
-  CUDACHECK(cudaMalloc(&deviceErrors, sizeof(int)));
-  CUDACHECK(cudaMalloc(&deviceTotalErrors, sizeof(int)));
-
-  if (rank == 0) {
-    std::printf("# nThread 1 nGpus %d minBytes %zu maxBytes %zu stepFactor %d warmup %d iters %d\n",
-                nranks, minBytes, maxBytes, stepFactor, warmupIters, iters);
-    std::printf("# %-12s %-12s %-8s %-8s %-12s %-12s %-12s %-8s\n",
-                "size", "count", "type", "op", "time(us)", "algbw(GB/s)",
-                "busbw(GB/s)", "errors");
-  }
-
   bool passed = true;
-  double busBwSum = 0.0;
-  int busBwCount = 0;
   for (size_t bytes = minBytes; bytes <= maxBytes;) {
     size_t recvcount = bytes / sizeof(float);
     size_t total = recvcount * static_cast<size_t>(nranks);
     fillInput<<<blocksFor(total), Threads, 0, stream>>>(sendbuff, recvcount, nranks, rank);
     CUDACHECK(cudaGetLastError());
-
     for (int i = 0; i < warmupIters; i++) {
       NCCLCHECK(ncclReduceScatterCompressed(sendbuff, recvbuff, recvcount, ncclFloat,
                                              ncclSum, comm, &plan, stream));
-      CUDACHECK(cudaStreamSynchronize(stream));
     }
+    CUDACHECK(cudaStreamSynchronize(stream));
 
     double totalMs = 0.0;
     for (int i = 0; i < iters; i++) {
@@ -242,42 +250,17 @@ int runRank(int rank, int nranks, const ncclUniqueId& id, size_t minBytes,
       if (result[i] != expectedValue(nranks, rank, i)) errors++;
     }
 
-    float localUs = static_cast<float>(totalMs * 1000.0 / iters);
-    CUDACHECK(cudaMemcpyAsync(deviceTime, &localUs, sizeof(localUs), cudaMemcpyHostToDevice, stream));
-    CUDACHECK(cudaMemcpyAsync(deviceErrors, &errors, sizeof(errors), cudaMemcpyHostToDevice, stream));
-    NCCLCHECK(ncclGroupStart());
-    NCCLCHECK(ncclAllReduce(deviceTime, deviceMaxTime, 1, ncclFloat, ncclMax, comm, stream));
-    NCCLCHECK(ncclAllReduce(deviceErrors, deviceTotalErrors, 1, ncclInt, ncclSum, comm, stream));
-    NCCLCHECK(ncclGroupEnd());
-    float maxUs = 0.0f;
-    int totalErrors = 0;
-    CUDACHECK(cudaMemcpyAsync(&maxUs, deviceMaxTime, sizeof(maxUs), cudaMemcpyDeviceToHost, stream));
-    CUDACHECK(cudaMemcpyAsync(&totalErrors, deviceTotalErrors, sizeof(totalErrors), cudaMemcpyDeviceToHost, stream));
-    CUDACHECK(cudaStreamSynchronize(stream));
-    passed = passed && totalErrors == 0;
-
-    if (rank == 0) {
-      double sec = maxUs / 1.0e6;
-      double algbw = static_cast<double>(bytes) * nranks / 1.0e9 / sec;
-      double busbw = algbw * static_cast<double>(nranks - 1) / nranks;
-      busBwSum += busbw;
-      busBwCount++;
-      std::printf("  %-12zu %-12zu %-8s %-8s %-12.1f %-12.2f %-12.2f %-8d\n",
-                  bytes, recvcount, "float", "sum", maxUs, algbw, busbw, totalErrors);
-      std::fflush(stdout);
-    }
+    RankResult rankResult = {static_cast<float>(totalMs * 1000.0 / iters), errors};
+    if (!writeAll(resultFd, &rankResult, sizeof(rankResult))) return EXIT_FAILURE;
+    char release = 0;
+    if (!readAll(releaseFd, &release, sizeof(release))) return EXIT_FAILURE;
+    passed = passed && errors == 0;
     if (bytes > maxBytes / static_cast<size_t>(stepFactor)) break;
     bytes *= static_cast<size_t>(stepFactor);
   }
-  if (rank == 0 && busBwCount != 0)
-    std::printf("# Avg bus bandwidth: %.2f GB/s\n", busBwSum / busBwCount);
 
   CUDACHECK(cudaFree(sendbuff));
   CUDACHECK(cudaFree(recvbuff));
-  CUDACHECK(cudaFree(deviceTime));
-  CUDACHECK(cudaFree(deviceMaxTime));
-  CUDACHECK(cudaFree(deviceErrors));
-  CUDACHECK(cudaFree(deviceTotalErrors));
   CUDACHECK(cudaEventDestroy(start));
   CUDACHECK(cudaEventDestroy(stop));
   CUDACHECK(cudaStreamDestroy(stream));
@@ -286,7 +269,7 @@ int runRank(int rank, int nranks, const ncclUniqueId& id, size_t minBytes,
 }
 
 int main(int argc, char** argv) {
-  if (argc == 10 && std::string(argv[1]) == "--worker") {
+  if (argc == 12 && std::string(argv[1]) == "--worker") {
     int rank = std::atoi(argv[2]);
     int nranks = std::atoi(argv[3]);
     ncclUniqueId id;
@@ -298,7 +281,8 @@ int main(int argc, char** argv) {
       id.internal[i] = static_cast<char>(byte);
     }
     return runRank(rank, nranks, id, parseBytes(argv[5]), parseBytes(argv[6]),
-                   std::atoi(argv[7]), std::atoi(argv[8]), std::atoi(argv[9]));
+                   std::atoi(argv[7]), std::atoi(argv[8]), std::atoi(argv[9]),
+                   std::atoi(argv[10]), std::atoi(argv[11]));
   }
   size_t minBytes = 512 * 1024;
   size_t maxBytes = 64 * 1024 * 1024;
@@ -338,9 +322,19 @@ int main(int argc, char** argv) {
     idHex[2 * i + 1] = digits[byte & 15];
   }
   std::vector<pid_t> children;
+  std::vector<int> resultFds;
+  std::vector<int> releaseFds;
   for (int rank = 0; rank < nranks; rank++) {
+    int resultPipe[2];
+    int releasePipe[2];
+    if (pipe(resultPipe) != 0 || pipe(releasePipe) != 0) {
+      std::perror("pipe");
+      return EXIT_FAILURE;
+    }
     pid_t pid = fork();
     if (pid == 0) {
+      close(resultPipe[0]);
+      close(releasePipe[1]);
       std::string rankText = std::to_string(rank);
       std::string ranksText = std::to_string(nranks);
       std::string minText = std::to_string(minBytes);
@@ -348,9 +342,11 @@ int main(int argc, char** argv) {
       std::string factorText = std::to_string(stepFactor);
       std::string warmupText = std::to_string(warmupIters);
       std::string itersText = std::to_string(iters);
+      std::string resultFdText = std::to_string(resultPipe[1]);
+      std::string releaseFdText = std::to_string(releasePipe[0]);
       execl(argv[0], argv[0], "--worker", rankText.c_str(), ranksText.c_str(), idHex.c_str(),
             minText.c_str(), maxText.c_str(), factorText.c_str(), warmupText.c_str(),
-            itersText.c_str(), nullptr);
+            itersText.c_str(), resultFdText.c_str(), releaseFdText.c_str(), nullptr);
       std::perror("exec");
       _exit(EXIT_FAILURE);
     }
@@ -358,14 +354,62 @@ int main(int argc, char** argv) {
       std::perror("fork");
       return EXIT_FAILURE;
     }
+    close(resultPipe[1]);
+    close(releasePipe[0]);
     children.push_back(pid);
+    resultFds.push_back(resultPipe[0]);
+    releaseFds.push_back(releasePipe[1]);
   }
+
+  std::printf("# nThread 1 nGpus %d minBytes %zu maxBytes %zu stepFactor %d warmup %d iters %d\n",
+              nranks, minBytes, maxBytes, stepFactor, warmupIters, iters);
+  std::printf("# %-12s %-12s %-8s %-8s %-12s %-12s %-12s %-8s\n",
+              "size", "count", "type", "op", "time(us)", "algbw(GB/s)",
+              "busbw(GB/s)", "errors");
+  double busBwSum = 0.0;
+  int busBwCount = 0;
   bool passed = true;
+  for (size_t bytes = minBytes; bytes <= maxBytes;) {
+    std::printf("# Running size %zu bytes\n", bytes);
+    std::fflush(stdout);
+    float maxUs = 0.0f;
+    int totalErrors = 0;
+    for (int rank = 0; rank < nranks; rank++) {
+      RankResult result = {};
+      if (!readAll(resultFds[rank], &result, sizeof(result))) {
+        passed = false;
+        break;
+      }
+      maxUs = std::max(maxUs, result.timeUs);
+      totalErrors += result.errors;
+    }
+    if (!passed) break;
+    double sec = maxUs / 1.0e6;
+    double algbw = static_cast<double>(bytes) * nranks / 1.0e9 / sec;
+    double busbw = algbw * static_cast<double>(nranks - 1) / nranks;
+    busBwSum += busbw;
+    busBwCount++;
+    std::printf("  %-12zu %-12zu %-8s %-8s %-12.1f %-12.2f %-12.2f %-8d\n",
+                bytes, bytes / sizeof(float), "float", "sum", maxUs, algbw, busbw,
+                totalErrors);
+    std::fflush(stdout);
+    passed = passed && totalErrors == 0;
+    char release = 0;
+    for (int rank = 0; rank < nranks; rank++)
+      if (!writeAll(releaseFds[rank], &release, sizeof(release))) passed = false;
+    if (bytes > maxBytes / static_cast<size_t>(stepFactor)) break;
+    bytes *= static_cast<size_t>(stepFactor);
+  }
+  if (busBwCount != 0)
+    std::printf("# Avg bus bandwidth: %.2f GB/s\n", busBwSum / busBwCount);
+
   for (pid_t child : children) {
     int status = 0;
     if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
       passed = false;
   }
+  for (int fd : resultFds) close(fd);
+  for (int fd : releaseFds) close(fd);
   if (!passed) return EXIT_FAILURE;
   std::printf("# compressed ReduceScatter benchmark passed on %d GPUs\n", nranks);
   return EXIT_SUCCESS;

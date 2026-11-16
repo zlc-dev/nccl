@@ -100,5 +100,7 @@ Restrictions
   every rank is required to use matching values without runtime negotiation.
 * CUDA graph capture is unsupported. ``ncclGroupStart``/``ncclGroupEnd`` defer
   setup and launch until group completion like other NCCL operations.
-* Concurrent compressed ReduceScatter calls on the same communicator are
-  unsupported. Every local rank must enter each call exactly once.
+* Calls on one rank are internally serialized. A following call waits for the
+  previous invocation's IPC close acknowledgement and resource reclamation
+  before exchanging its own endpoint. Concurrent submission from multiple Host
+  threads is unsupported. Every rank must enter calls in the same order.
