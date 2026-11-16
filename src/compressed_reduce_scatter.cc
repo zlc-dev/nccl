@@ -191,6 +191,15 @@ static ncclResult_t initializeManager(Operation* op) {
   CUDACHECKGOTO(cudaMemPoolImportFromShareableHandle(&m->nextPool,
       reinterpret_cast<void*>(static_cast<intptr_t>(importedFd)),
       cudaMemHandleTypePosixFileDescriptor, 0), ret, fail);
+  {
+    // Imported pools do not inherit the exporter's access map. Grant this
+    // rank's GPU access before importing or dereferencing any allocation.
+    cudaMemAccessDesc access = {};
+    access.location.type = cudaMemLocationTypeDevice;
+    access.location.id = comm->cudaDev;
+    access.flags = cudaMemAccessFlagsProtReadWrite;
+    CUDACHECKGOTO(cudaMemPoolSetAccess(m->nextPool, &access, 1), ret, fail);
+  }
   NCCLCHECKGOTO(ncclIpcSocketClose(&ipcSocket), ret, fail);
   NCCLCHECKGOTO(ncclIpcFdClose(exportedFd) == 0 ? ncclSuccess : ncclSystemError, ret, fail);
   exportedFd = NCCL_INVALID_IPC_FD;
