@@ -381,8 +381,6 @@ int main(int argc, char** argv) {
   int busBwCount = 0;
   bool passed = true;
   for (size_t bytes = minBytes; bytes <= maxBytes;) {
-    std::printf("# Running size %zu bytes\n", bytes);
-    std::fflush(stdout);
     float maxUs = 0.0f;
     int totalErrors = 0;
     for (int rank = 0; rank < nranks; rank++) {
