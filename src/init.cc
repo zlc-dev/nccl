@@ -41,6 +41,7 @@
 #include "env.h"
 #include "rma/rma.h"
 #include "tuning.h"
+#include "compressed_reduce_scatter.h"
 
 #include <cinttypes>
 
@@ -3130,6 +3131,7 @@ static ncclResult_t commDestroySync(struct ncclAsyncJob* job_) {
         (int)COMPILER_ATOMIC_LOAD(comm->abortFlag, std::memory_order_acquire), comm->asyncResult);
 
   if (comm->initState == ncclSuccess) {
+    NCCLCHECKGOTO(ncclCompressedRsDestroy(comm), ret, fail);
     if ((ret = ncclStrongStreamSynchronize(&comm->sharedRes->hostStream)) != ncclSuccess) {
       INFO(NCCL_DESTROY, "commDestroySync: comm 0x%" PRIx64 " rank %d sync hostStream error %d", comm->commHash,
            comm->rank, ret);

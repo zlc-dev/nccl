@@ -500,6 +500,66 @@ typedef enum { ncclInt8       = 0, ncclChar       = 0,
                ncclNumTypes   = 12
 } ncclDataType_t;
 
+/* Experimental host-orchestrated compressed ReduceScatter support. */
+typedef struct ncclCompressedFrameHeader {
+  uint32_t payloadBytes;
+  uint32_t flags;
+  uint32_t reserved0;
+  uint32_t reserved1;
+} ncclCompressedFrameHeader_t;
+
+#define NCCL_COMPRESSED_FRAME_FLAG_SIZE_ERROR 0x1u
+
+/*
+ * Device-resident task populated by NCCL before invoking a compression callback.
+ * One callback invocation processes exactly one contiguous block.
+ */
+typedef struct ncclCompressionTask {
+  const void* compressedInput;
+  const ncclCompressedFrameHeader_t* inputHeader;
+  void* compressedOutput;
+  ncclCompressedFrameHeader_t* outputHeader;
+  const void* localInput;
+  void* output;
+  size_t elementCount;
+  size_t compressedCapacity;
+  uint64_t reserved[2];
+} ncclCompressionTask_t;
+
+typedef ncclResult_t (*ncclCompressionMaxBytesFn)(
+    size_t elementCount, ncclDataType_t datatype, void* context,
+    size_t* maxCompressedBytes);
+
+typedef ncclResult_t (*ncclCompressionEncodeFn)(
+    const ncclCompressionTask_t* task,
+    ncclDataType_t datatype, void* context, cudaStream_t stream);
+
+typedef ncclResult_t (*ncclCompressionDecodeReduceEncodeFn)(
+    const ncclCompressionTask_t* task,
+    ncclDataType_t datatype, ncclRedOp_t op, void* context, cudaStream_t stream);
+
+typedef ncclResult_t (*ncclCompressionDecodeReduceCopyFn)(
+    const ncclCompressionTask_t* task,
+    ncclDataType_t datatype, ncclRedOp_t op, void* context, cudaStream_t stream);
+
+typedef struct ncclCompressionPlan {
+  size_t size;
+  unsigned int magic;
+  unsigned int version;
+  size_t blockElements;
+  void* context;
+  ncclCompressionMaxBytesFn maxCompressedBytes;
+  ncclCompressionEncodeFn encode;
+  ncclCompressionDecodeReduceEncodeFn decodeReduceEncode;
+  ncclCompressionDecodeReduceCopyFn decodeReduceCopy;
+} ncclCompressionPlan_t;
+
+#define NCCL_COMPRESSION_PLAN_MAGIC 0x43525350
+#define NCCL_COMPRESSION_PLAN_INITIALIZER { \
+  sizeof(ncclCompressionPlan_t), NCCL_COMPRESSION_PLAN_MAGIC, NCCL_VERSION_CODE, \
+  0, NULL, NULL, NULL, NULL, NULL \
+}
+
 /* ncclScalarResidence_t: Location and dereferencing logic for scalar arguments. */
 typedef enum {
   /* ncclScalarDevice: The scalar is in device-visible memory and will be
@@ -621,6 +681,19 @@ ncclResult_t  ncclReduceScatter(const void* sendbuff, void* recvbuff,
 ncclResult_t pncclReduceScatter(const void* sendbuff, void* recvbuff,
     size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
     cudaStream_t stream);
+
+/*
+ * Host-orchestrated Ring ReduceScatter with user-provided compression kernels.
+ * Compression callbacks operate directly on two-slot P2P arenas described by device tasks.
+ */
+ncclResult_t ncclReduceScatterCompressed(
+    const void* sendbuff, void* recvbuff, size_t recvcount,
+    ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
+    const ncclCompressionPlan_t* plan, cudaStream_t stream);
+ncclResult_t pncclReduceScatterCompressed(
+    const void* sendbuff, void* recvbuff, size_t recvcount,
+    ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
+    const ncclCompressionPlan_t* plan, cudaStream_t stream);
 
 /*
  * All-Gather

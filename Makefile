@@ -4,7 +4,7 @@
 #
 # See LICENSE.txt for more license information
 #
-.PHONY: all clean ir-emit
+.PHONY: all clean ir-emit tests.build tests.run tests.clean
 
 EMIT_LLVM_IR ?= 0
 NCCL_EMIT_LTO_IR ?= 0
@@ -46,6 +46,15 @@ src.%:
 
 examples: src.build
 	${MAKE} -C docs/examples NCCL_HOME=${ABSBUILDDIR}
+
+tests.build: src.build
+	${MAKE} -C tests build BUILDDIR=${ABSBUILDDIR}
+
+tests.run: tests.build
+	${MAKE} -C tests run BUILDDIR=${ABSBUILDDIR}
+
+tests.clean:
+	${MAKE} -C tests clean BUILDDIR=${ABSBUILDDIR}
 
 pkg.%:
 	${MAKE} -C pkg $* BUILDDIR=${ABSBUILDDIR}

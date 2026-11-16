@@ -569,6 +569,7 @@ typedef enum ncclGroupTaskType {
 } ncclGroupTaskType_t;
 
 struct ncclCommSymTeams;
+struct ncclCompressedRsManager;
 
 // NCCL_CHECK_MODE=DEBUG_LOCAL/DEBUG_GLOBAL
 // ncclCheckModeDebugLocal : check the input args/pointers locally, it replaces ncclParamCheckPointers()
@@ -592,6 +593,7 @@ struct ncclComm {
   int* topParentLocalRanks;
   struct ncclChannel channels[MAXCHANNELS];
   struct ncclPeerInfo* peerInfo;
+  struct ncclCompressedRsManager* compressedRsManager;
   struct ncclTopoSystem* topo;
   struct ncclProxyConnector* gproxyConn;
   struct ncclIntruQueue<struct ncclCommCallback, &ncclCommCallback::next> legacyRegCleanupQueue;
