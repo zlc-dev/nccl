@@ -35,12 +35,16 @@
 
 namespace {
 
-constexpr size_t BlockElements = 131072;
+constexpr size_t DefaultBlockBytes = 512 * 1024;
 constexpr int Threads = 256;
 
 struct RankResult {
   float timeUs;
   int errors;
+};
+
+struct IdentityContext {
+  size_t blockElements;
 };
 
 bool writeAll(int fd, const void* data, size_t bytes) {
@@ -153,25 +157,28 @@ ncclResult_t maxIdentityBytes(size_t elementCount, ncclDataType_t datatype,
 }
 
 ncclResult_t launchEncode(const ncclCompressionTask_t* task, ncclDataType_t datatype,
-                          void*, cudaStream_t stream) {
-  if (datatype != ncclFloat) return ncclInvalidArgument;
-  encodeIdentity<<<blocksFor(BlockElements), Threads, Threads * sizeof(float), stream>>>(task);
+                          void* context, cudaStream_t stream) {
+  if (datatype != ncclFloat || context == nullptr) return ncclInvalidArgument;
+  const IdentityContext* identity = static_cast<const IdentityContext*>(context);
+  encodeIdentity<<<blocksFor(identity->blockElements), Threads, Threads * sizeof(float), stream>>>(task);
   return cudaGetLastError() == cudaSuccess ? ncclSuccess : ncclUnhandledCudaError;
 }
 
 ncclResult_t launchDecodeReduceEncode(const ncclCompressionTask_t* task,
                                       ncclDataType_t datatype, ncclRedOp_t op,
-                                      void*, cudaStream_t stream) {
-  if (datatype != ncclFloat || op != ncclSum) return ncclInvalidArgument;
-  decodeReduceEncodeIdentity<<<blocksFor(BlockElements), Threads, 2 * Threads * sizeof(float), stream>>>(task);
+                                      void* context, cudaStream_t stream) {
+  if (datatype != ncclFloat || op != ncclSum || context == nullptr) return ncclInvalidArgument;
+  const IdentityContext* identity = static_cast<const IdentityContext*>(context);
+  decodeReduceEncodeIdentity<<<blocksFor(identity->blockElements), Threads, 2 * Threads * sizeof(float), stream>>>(task);
   return cudaGetLastError() == cudaSuccess ? ncclSuccess : ncclUnhandledCudaError;
 }
 
 ncclResult_t launchDecodeReduceCopy(const ncclCompressionTask_t* task,
                                     ncclDataType_t datatype, ncclRedOp_t op,
-                                    void*, cudaStream_t stream) {
-  if (datatype != ncclFloat || op != ncclSum) return ncclInvalidArgument;
-  decodeReduceCopyIdentity<<<blocksFor(BlockElements), Threads, 2 * Threads * sizeof(float), stream>>>(task);
+                                    void* context, cudaStream_t stream) {
+  if (datatype != ncclFloat || op != ncclSum || context == nullptr) return ncclInvalidArgument;
+  const IdentityContext* identity = static_cast<const IdentityContext*>(context);
+  decodeReduceCopyIdentity<<<blocksFor(identity->blockElements), Threads, 2 * Threads * sizeof(float), stream>>>(task);
   return cudaGetLastError() == cudaSuccess ? ncclSuccess : ncclUnhandledCudaError;
 }
 
@@ -195,7 +202,7 @@ size_t parseBytes(const char* text) {
 
 int runRank(int rank, int nranks, const ncclUniqueId& id, size_t minBytes,
             size_t maxBytes, int stepFactor, int warmupIters, int iters,
-            int resultFd, int releaseFd) {
+            size_t blockElements, int resultFd, int releaseFd) {
   CUDACHECK(cudaSetDevice(rank));
   ncclComm_t comm;
   cudaStream_t stream;
@@ -211,8 +218,10 @@ int runRank(int rank, int nranks, const ncclUniqueId& id, size_t minBytes,
   CUDACHECK(cudaMalloc(&recvbuff, maxRecvcount * sizeof(float)));
   CUDACHECK(cudaMalloc(&interopBarrier, sizeof(*interopBarrier)));
 
+  IdentityContext identity = {blockElements};
   ncclCompressionPlan_t plan = NCCL_COMPRESSION_PLAN_INITIALIZER;
-  plan.blockElements = BlockElements;
+  plan.blockElements = blockElements;
+  plan.context = &identity;
   plan.maxCompressedBytes = maxIdentityBytes;
   plan.encode = launchEncode;
   plan.decodeReduceEncode = launchDecodeReduceEncode;
@@ -280,7 +289,7 @@ int runRank(int rank, int nranks, const ncclUniqueId& id, size_t minBytes,
 }
 
 int main(int argc, char** argv) {
-  if (argc == 12 && std::string(argv[1]) == "--worker") {
+  if (argc == 13 && std::string(argv[1]) == "--worker") {
     int rank = std::atoi(argv[2]);
     int nranks = std::atoi(argv[3]);
     ncclUniqueId id;
@@ -293,10 +302,12 @@ int main(int argc, char** argv) {
     }
     return runRank(rank, nranks, id, parseBytes(argv[5]), parseBytes(argv[6]),
                    std::atoi(argv[7]), std::atoi(argv[8]), std::atoi(argv[9]),
-                   std::atoi(argv[10]), std::atoi(argv[11]));
+                   static_cast<size_t>(std::strtoull(argv[10], nullptr, 0)),
+                   std::atoi(argv[11]), std::atoi(argv[12]));
   }
-  size_t minBytes = 512 * 1024;
+  size_t minBytes = DefaultBlockBytes;
   size_t maxBytes = 64 * 1024 * 1024;
+  size_t blockBytes = DefaultBlockBytes;
   int stepFactor = 2;
   int warmupIters = 5;
   int iters = 20;
@@ -309,6 +320,7 @@ int main(int argc, char** argv) {
     else if (std::string(argv[i]) == "-w") warmupIters = std::atoi(argv[++i]);
     else if (std::string(argv[i]) == "-n") iters = std::atoi(argv[++i]);
     else if (std::string(argv[i]) == "-g") requestedRanks = std::atoi(argv[++i]);
+    else if (std::string(argv[i]) == "-c") blockBytes = parseBytes(argv[++i]);
     else return EXIT_FAILURE;
   }
   int visibleDevices = 0;
@@ -318,10 +330,14 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "Need 2..%d GPUs, requested %d\n", visibleDevices, nranks);
     return 77;
   }
-  minBytes = std::max(minBytes, BlockElements * sizeof(float));
+  minBytes = std::max(minBytes, DefaultBlockBytes);
   minBytes -= minBytes % sizeof(float);
   maxBytes -= maxBytes % sizeof(float);
-  if (maxBytes < minBytes || stepFactor < 2 || warmupIters < 0 || iters < 1) return EXIT_FAILURE;
+  blockBytes -= blockBytes % sizeof(float);
+  if (maxBytes < minBytes || blockBytes < DefaultBlockBytes ||
+      blockBytes > UINT32_MAX - UINT32_MAX % sizeof(float) ||
+      stepFactor < 2 || warmupIters < 0 || iters < 1) return EXIT_FAILURE;
+  size_t blockElements = blockBytes / sizeof(float);
 
   ncclUniqueId id;
   NCCLCHECK(ncclGetUniqueId(&id));
@@ -353,11 +369,13 @@ int main(int argc, char** argv) {
       std::string factorText = std::to_string(stepFactor);
       std::string warmupText = std::to_string(warmupIters);
       std::string itersText = std::to_string(iters);
+      std::string blockElementsText = std::to_string(blockElements);
       std::string resultFdText = std::to_string(resultPipe[1]);
       std::string releaseFdText = std::to_string(releasePipe[0]);
       execl(argv[0], argv[0], "--worker", rankText.c_str(), ranksText.c_str(), idHex.c_str(),
             minText.c_str(), maxText.c_str(), factorText.c_str(), warmupText.c_str(),
-            itersText.c_str(), resultFdText.c_str(), releaseFdText.c_str(), nullptr);
+            itersText.c_str(), blockElementsText.c_str(), resultFdText.c_str(),
+            releaseFdText.c_str(), nullptr);
       std::perror("exec");
       _exit(EXIT_FAILURE);
     }
@@ -372,8 +390,8 @@ int main(int argc, char** argv) {
     releaseFds.push_back(releasePipe[1]);
   }
 
-  std::printf("# nThread 1 nGpus %d minBytes %zu maxBytes %zu stepFactor %d warmup %d iters %d\n",
-              nranks, minBytes, maxBytes, stepFactor, warmupIters, iters);
+  std::printf("# nThread 1 nGpus %d minBytes %zu maxBytes %zu blockBytes %zu stepFactor %d warmup %d iters %d\n",
+              nranks, minBytes, maxBytes, blockBytes, stepFactor, warmupIters, iters);
   std::printf("# %-12s %-12s %-8s %-8s %-12s %-12s %-12s %-8s\n",
               "size", "count", "type", "op", "time(us)", "algbw(GB/s)",
               "busbw(GB/s)", "errors");
@@ -386,6 +404,7 @@ int main(int argc, char** argv) {
     for (int rank = 0; rank < nranks; rank++) {
       RankResult result = {};
       if (!readAll(resultFds[rank], &result, sizeof(result))) {
+        std::fprintf(stderr, "rank %d exited before reporting size %zu\n", rank, bytes);
         passed = false;
         break;
       }
@@ -412,10 +431,20 @@ int main(int argc, char** argv) {
   if (busBwCount != 0)
     std::printf("# Avg bus bandwidth: %.2f GB/s\n", busBwSum / busBwCount);
 
-  for (pid_t child : children) {
+  for (size_t rank = 0; rank < children.size(); rank++) {
     int status = 0;
-    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    pid_t child = children[rank];
+    if (waitpid(child, &status, 0) != child) {
+      std::fprintf(stderr, "failed to wait for rank %zu worker\n", rank);
       passed = false;
+    } else if (WIFSIGNALED(status)) {
+      std::fprintf(stderr, "rank %zu worker terminated by signal %d\n", rank, WTERMSIG(status));
+      passed = false;
+    } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      std::fprintf(stderr, "rank %zu worker exited with status %d\n", rank,
+                   WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+      passed = false;
+    }
   }
   for (int fd : resultFds) close(fd);
   for (int fd : releaseFds) close(fd);
