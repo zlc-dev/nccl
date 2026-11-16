@@ -131,6 +131,20 @@ __global__ void releaseKernel(void* rxSlot, uint32_t* abortFlag) {
   }
 }
 
+__global__ void signalKernel(uint64_t* address, uint64_t value) {
+  if (threadIdx.x == 0) {
+    __threadfence_system();
+    st_relaxed_sys_global(address, value);
+  }
+}
+
+__global__ void waitKernel(uint64_t* address, uint64_t value, uint32_t* abortFlag) {
+  if (threadIdx.x == 0) {
+    while (ld_volatile_global(address) != value && !isAborted(abortFlag));
+    fence_acq_rel_sys();
+  }
+}
+
 } // namespace
 
 ncclResult_t ncclLaunchCompressedPrepareEncode(
@@ -166,6 +180,21 @@ ncclResult_t ncclLaunchCompressedSend(
 ncclResult_t ncclLaunchCompressedRelease(
     void* rxSlot, uint32_t* abortFlag, cudaStream_t stream) {
   releaseKernel<<<1, 1, 0, stream>>>(rxSlot, abortFlag);
+  CUDACHECK(cudaGetLastError());
+  return ncclSuccess;
+}
+
+ncclResult_t ncclLaunchCompressedSignal(
+    uint64_t* address, uint64_t value, cudaStream_t stream) {
+  signalKernel<<<1, 1, 0, stream>>>(address, value);
+  CUDACHECK(cudaGetLastError());
+  return ncclSuccess;
+}
+
+ncclResult_t ncclLaunchCompressedWait(
+    uint64_t* address, uint64_t value,
+    uint32_t* abortFlag, cudaStream_t stream) {
+  waitKernel<<<1, 1, 0, stream>>>(address, value, abortFlag);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }

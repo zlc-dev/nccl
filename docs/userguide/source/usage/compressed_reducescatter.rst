@@ -77,17 +77,22 @@ then marks the slot free. Compressed lengths never return to the CPU. CUDA
 events order the communication stream and codec stream, allowing communication
 on one slot to overlap codec work on the other.
 
-Each communicator retains its normal NCCL connection state. Every compressed
-ReduceScatter invocation allocates its own local TX/RX slots and task
-descriptors. Ranks use the communicator bootstrap connection to exchange only
-the current RX CUDA IPC handles; codec identity, capacity, layout, and other
-metadata are assumed to be identical and are not negotiated or validated.
+The communicator owns an IPC-capable CUDA memory pool connection and a small,
+capacity-independent control page. Every invocation allocates its own TX/RX
+slots and task descriptors from that pool and exchanges only the exported RX
+allocation metadata. Codec identity, capacity, layout, and other metadata are
+assumed to be identical on every rank and are not negotiated or validated.
 
 The API returns after work has been enqueued and never synchronizes the user
-stream. After the local GPU work completes, internal cleanup closes the next
-rank's imported RX mapping, exchanges a neighboring close acknowledgement, and
-releases the invocation's TX/RX slots and task descriptors. No resource handle
-or explicit context is exposed to the caller.
+stream. Cleanup is part of the enqueued operation: after the final RX-slot
+release, the communication stream frees the imported RX pointer, signals its
+owner through the control page, waits until the previous rank has freed this
+rank's exported pointer, and then frees the local RX, TX, and task allocations.
+The user-stream completion point follows these stream-ordered frees. There is
+no background cleanup thread, and a capacity change does not rebuild the
+connection. An internal tail event orders consecutive invocations, including
+invocations submitted on different CUDA streams. No resource handle or
+explicit context is exposed to the caller.
 
 Restrictions
 ------------
@@ -96,11 +101,11 @@ Restrictions
 * Direct CUDA peer access must exist along channel 0's Ring edges.
 * Only ``ncclSum`` is supported.
 * The codec's worst-case compressed size must fit in ``uint32_t``.
+* CUDA memory-pool IPC with POSIX file-descriptor handles is required.
 * Codec configuration and capacity may change between non-overlapping calls;
   every rank is required to use matching values without runtime negotiation.
 * CUDA graph capture is unsupported. ``ncclGroupStart``/``ncclGroupEnd`` defer
   setup and launch until group completion like other NCCL operations.
-* Calls on one rank are internally serialized. A following call waits for the
-  previous invocation's IPC close acknowledgement and resource reclamation
-  before exchanging its own endpoint. Concurrent submission from multiple Host
-  threads is unsupported. Every rank must enter calls in the same order.
+* Calls on one rank are internally serialized by the connection tail event.
+  Concurrent submission from multiple Host threads is unsupported. Every rank
+  must enter calls in the same order.

@@ -9,31 +9,34 @@
 #include "compressed_reduce_scatter.h"
 #include "core.h"
 #include "group.h"
+#include "ipcsocket.h"
 #include "strongstream.h"
 #include "transport.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <new>
-#include <thread>
 #include <vector>
 
 struct ncclCompressedRsManager {
   std::mutex mutex;
-  std::thread cleanup;
-  std::atomic<bool> active{false};
+  cudaMemPool_t localPool = nullptr;
+  cudaMemPool_t nextPool = nullptr;
+  ncclCompressedP2pControl* control = nullptr;
+  ncclCompressedP2pControl* remoteControl = nullptr;
+  cudaEvent_t tail = nullptr;
   uint64_t sequence = 0;
-  ncclResult_t cleanupResult = ncclSuccess;
+  bool tailRecorded = false;
+  bool initialized = false;
 };
 
 namespace {
 constexpr size_t MinBlockBytes = 512 * 1024;
 constexpr size_t SlotAlignment = 256;
 constexpr size_t PayloadOffset = (sizeof(ncclCompressedP2pSlot) + 15) & ~size_t(15);
-constexpr int CleanupTagBase = 0x43520000;
+constexpr uint64_t IpcSocketHashSalt = 0x435253504f4f4cULL;
 
 struct Operation {
   ncclComm* comm = nullptr;
@@ -42,10 +45,8 @@ struct Operation {
   void* rx = nullptr;
   void* remoteRx = nullptr;
   ncclCompressionTask_t* tasks = nullptr;
-  cudaEvent_t complete = nullptr;
   size_t stride = 0;
   uint64_t sequence = 0;
-  bool exchanged = false;
 };
 
 struct Job {
@@ -105,98 +106,117 @@ static ncclResult_t claim(ncclComm* comm, Operation* op) {
     }
   }
   ncclCompressedRsManager* m = comm->compressedRsManager;
-  std::thread finished;
-  {
-    std::lock_guard<std::mutex> lock(m->mutex);
-    if (m->cleanup.joinable()) finished = std::move(m->cleanup);
-    else if (m->active.load(std::memory_order_acquire)) {
-      // Another host thread is still submitting this rank's current operation.
-      // Calls serialized by the rank's normal API thread always have a cleanup
-      // thread here and are queued by joining it below.
-      WARN("ncclReduceScatterCompressed: concurrent submissions from multiple host threads are unsupported");
-      return ncclInvalidUsage;
-    }
-  }
-  if (finished.joinable()) finished.join();
-  std::lock_guard<std::mutex> lock(m->mutex);
-  if (m->cleanupResult != ncclSuccess) return m->cleanupResult;
-  m->active.store(true, std::memory_order_release);
   op->comm = comm;
   op->manager = m;
-  op->sequence = m->sequence++;
   return ncclSuccess;
 }
 
-static ncclResult_t release(Operation* op, bool waitGpu) {
+static ncclResult_t destroyManagerResources(ncclComm* comm, ncclCompressedRsManager* m) {
   ncclResult_t ret = ncclSuccess;
   int savedDev = -1;
   CUDACHECKGOTO(cudaGetDevice(&savedDev), ret, done);
-  CUDACHECKGOTO(cudaSetDevice(op->comm->cudaDev), ret, done);
-  trace(op, "cleanup-wait-gpu");
-  if (waitGpu && op->complete) CUDACHECKGOTO(cudaEventSynchronize(op->complete), ret, done);
-  trace(op, "cleanup-gpu-done");
-  if (op->remoteRx) {
-    CUDACHECKGOTO(cudaIpcCloseMemHandle(op->remoteRx), ret, done);
-    op->remoteRx = nullptr;
+  CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), ret, done);
+  if (m->tailRecorded) CUDACHECKGOTO(cudaEventSynchronize(m->tail), ret, done);
+  if (m->remoteControl) {
+    CUDACHECKGOTO(cudaFree(m->remoteControl), ret, done);
+    m->remoteControl = nullptr;
   }
-  if (op->exchanged && op->comm->nRanks > 1) {
-    int tag = CleanupTagBase | static_cast<int>(op->sequence & 0xffff);
-    // Every imported next-rank mapping must be closed before any rank frees its
-    // exported RX allocation. The barrier also separates cleanup traffic from
-    // the following operation's endpoint all-gather on the bootstrap state.
-    trace(op, "cleanup-barrier-enter");
-    NCCLCHECKGOTO(bootstrapBarrier(op->comm->bootstrap, op->comm->rank,
-                                   op->comm->nRanks, tag), ret, done);
-    trace(op, "cleanup-barrier-exit");
+  if (m->initialized && comm->nRanks > 1) {
+    NCCLCHECKGOTO(bootstrapBarrier(comm->bootstrap, comm->rank, comm->nRanks, 0x43525002), ret, done);
   }
 done:
-  if (op->complete) CUDACHECKIGNORE(cudaEventDestroy(op->complete));
-  if (op->tasks) CUDACHECKIGNORE(cudaFree(op->tasks));
-  if (op->tx) CUDACHECKIGNORE(cudaFree(op->tx));
-  if (op->rx) CUDACHECKIGNORE(cudaFree(op->rx));
+  if (m->control) CUDACHECKIGNORE(cudaFree(m->control));
+  if (m->nextPool) CUDACHECKIGNORE(cudaMemPoolDestroy(m->nextPool));
+  if (m->localPool) CUDACHECKIGNORE(cudaMemPoolDestroy(m->localPool));
+  m->control = nullptr;
+  m->nextPool = nullptr;
+  m->localPool = nullptr;
+  m->tailRecorded = false;
+  m->initialized = false;
   if (savedDev >= 0) CUDACHECKIGNORE(cudaSetDevice(savedDev));
-  trace(op, "cleanup-released");
   return ret;
 }
 
-static void cleanup(Operation* op) {
-  ncclResult_t ret = release(op, true);
-  ncclCompressedRsManager* m = op->manager;
-  ncclComm* comm = op->comm;
-  delete op;
-  if (ret != ncclSuccess) (void)ncclCommSetAsyncError(comm, ret);
-  std::lock_guard<std::mutex> lock(m->mutex);
-  m->cleanupResult = ret;
-  m->active.store(false, std::memory_order_release);
-}
-
-static ncclResult_t allocateExchange(Operation* op, size_t capacity) {
+static ncclResult_t initializeManager(Operation* op) {
   ncclResult_t ret = ncclSuccess;
   ncclComm* comm = op->comm;
+  ncclCompressedRsManager* m = op->manager;
+  if (m->initialized) return ncclSuccess;
   int next = comm->channels[0].ring.next;
-  int access = 0;
-  op->stride = alignUp(PayloadOffset + capacity, SlotAlignment);
-  if (op->stride > SIZE_MAX / NCCL_COMPRESSED_PIPELINE_DEPTH) return ncclInvalidArgument;
-  size_t bytes = op->stride * NCCL_COMPRESSED_PIPELINE_DEPTH;
-  std::vector<cudaIpcMemHandle_t> handles(comm->nRanks);
+  int prev = comm->channels[0].ring.prev;
+  int supported = 0;
+  ncclIpcSocket ipcSocket = {};
+  ncclIpcFd exportedFd = NCCL_INVALID_IPC_FD;
+  ncclIpcFd importedFd = NCCL_INVALID_IPC_FD;
+  cudaStream_t setupStream = nullptr;
+  cudaMemPoolPtrExportData controlData = {};
+  std::vector<cudaMemPoolPtrExportData> allControlData(comm->nRanks);
+  uint64_t socketHash = comm->commHash ^ IpcSocketHashSalt;
 
-  CUDACHECKGOTO(cudaDeviceCanAccessPeer(&access, comm->cudaDev, comm->peerInfo[next].cudaDev), ret, fail);
-  if (!access) {
-    WARN("ncclReduceScatterCompressed: no direct P2P access from rank %d to %d", comm->rank, next);
-    return ncclInvalidUsage;
+  CUDACHECKGOTO(cudaDeviceGetAttribute(&supported, cudaDevAttrMemoryPoolsSupported, comm->cudaDev), ret, fail);
+  if (!supported) {
+    WARN("ncclReduceScatterCompressed: CUDA memory pools are unsupported on device %d", comm->cudaDev);
+    ret = ncclInvalidUsage;
+    goto fail;
   }
-  trace(op, "exchange-allocate");
-  CUDACHECKGOTO(cudaMalloc(&op->tx, bytes), ret, fail);
-  CUDACHECKGOTO(cudaMalloc(&op->rx, bytes), ret, fail);
-  CUDACHECKGOTO(cudaMalloc(&op->tasks, sizeof(*op->tasks) * NCCL_COMPRESSED_PIPELINE_DEPTH), ret, fail);
-  CUDACHECKGOTO(cudaMemset(op->rx, 0, bytes), ret, fail);
-  CUDACHECKGOTO(cudaIpcGetMemHandle(&handles[comm->rank], op->rx), ret, fail);
-  NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, handles.data(), sizeof(cudaIpcMemHandle_t)), ret, fail);
-  CUDACHECKGOTO(cudaIpcOpenMemHandle(&op->remoteRx, handles[next],
-                                     cudaIpcMemLazyEnablePeerAccess), ret, fail);
-  op->exchanged = true;
-  trace(op, "exchange-ready");
+  CUDACHECKGOTO(cudaDeviceGetAttribute(&supported, cudaDevAttrMemoryPoolSupportedHandleTypes,
+                                       comm->cudaDev), ret, fail);
+  if ((supported & cudaMemHandleTypePosixFileDescriptor) == 0) {
+    WARN("ncclReduceScatterCompressed: POSIX FD memory-pool IPC is unsupported on device %d", comm->cudaDev);
+    ret = ncclInvalidUsage;
+    goto fail;
+  }
+  {
+    cudaMemPoolProps props = {};
+    props.allocType = cudaMemAllocationTypePinned;
+    props.handleTypes = cudaMemHandleTypePosixFileDescriptor;
+    props.location.type = cudaMemLocationTypeDevice;
+    props.location.id = comm->cudaDev;
+    CUDACHECKGOTO(cudaMemPoolCreate(&m->localPool, &props), ret, fail);
+  }
+  {
+    cudaMemAccessDesc access = {};
+    access.location.type = cudaMemLocationTypeDevice;
+    access.location.id = comm->peerInfo[prev].cudaDev;
+    access.flags = cudaMemAccessFlagsProtReadWrite;
+    CUDACHECKGOTO(cudaMemPoolSetAccess(m->localPool, &access, 1), ret, fail);
+  }
+  CUDACHECKGOTO(cudaEventCreateWithFlags(&m->tail, cudaEventDisableTiming), ret, fail);
+  NCCLCHECKGOTO(ncclIpcSocketInit(&ipcSocket, comm->rank, socketHash, comm->abortFlag), ret, fail);
+  CUDACHECKGOTO(cudaMemPoolExportToShareableHandle(&exportedFd, m->localPool,
+                                                   cudaMemHandleTypePosixFileDescriptor, 0), ret, fail);
+  NCCLCHECKGOTO(bootstrapBarrier(comm->bootstrap, comm->rank, comm->nRanks, 0x43525000), ret, fail);
+  NCCLCHECKGOTO(ncclIpcSocketSendFd(&ipcSocket, exportedFd, prev, socketHash), ret, fail);
+  NCCLCHECKGOTO(ncclIpcSocketRecvFd(&ipcSocket, &importedFd), ret, fail);
+  CUDACHECKGOTO(cudaMemPoolImportFromShareableHandle(&m->nextPool,
+      reinterpret_cast<void*>(static_cast<intptr_t>(importedFd)),
+      cudaMemHandleTypePosixFileDescriptor, 0), ret, fail);
+  NCCLCHECKGOTO(ncclIpcSocketClose(&ipcSocket), ret, fail);
+  NCCLCHECKGOTO(ncclIpcFdClose(exportedFd) == 0 ? ncclSuccess : ncclSystemError, ret, fail);
+  exportedFd = NCCL_INVALID_IPC_FD;
+  NCCLCHECKGOTO(ncclIpcFdClose(importedFd) == 0 ? ncclSuccess : ncclSystemError, ret, fail);
+  importedFd = NCCL_INVALID_IPC_FD;
+
+  CUDACHECKGOTO(cudaStreamCreateWithFlags(&setupStream, cudaStreamNonBlocking), ret, fail);
+  CUDACHECKGOTO(cudaMallocFromPoolAsync(reinterpret_cast<void**>(&m->control),
+      sizeof(*m->control), m->localPool, setupStream), ret, fail);
+  CUDACHECKGOTO(cudaMemsetAsync(m->control, 0, sizeof(*m->control), setupStream), ret, fail);
+  CUDACHECKGOTO(cudaStreamSynchronize(setupStream), ret, fail);
+  CUDACHECKGOTO(cudaMemPoolExportPointer(&controlData, m->control), ret, fail);
+  allControlData[comm->rank] = controlData;
+  NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allControlData.data(), sizeof(controlData)), ret, fail);
+  CUDACHECKGOTO(cudaMemPoolImportPointer(reinterpret_cast<void**>(&m->remoteControl),
+                                         m->nextPool, &allControlData[next]), ret, fail);
+  CUDACHECKGOTO(cudaStreamDestroy(setupStream), ret, fail);
+  setupStream = nullptr;
+  m->initialized = true;
+  trace(op, "connection-ready");
 fail:
+  if (setupStream) CUDACHECKIGNORE(cudaStreamDestroy(setupStream));
+  if (ipcSocket.fd != NCCL_INVALID_SOCKET) (void)ncclIpcSocketClose(&ipcSocket);
+  if (exportedFd != NCCL_INVALID_IPC_FD) (void)ncclIpcFdClose(exportedFd);
+  if (importedFd != NCCL_INVALID_IPC_FD) (void)ncclIpcFdClose(importedFd);
+  if (ret != ncclSuccess) (void)destroyManagerResources(comm, m);
   return ret;
 }
 
@@ -204,8 +224,13 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
   ncclResult_t ret = ncclSuccess;
   cudaStream_t cs = nullptr;
   cudaEvent_t ready[2] = {}, done[2] = {};
+  cudaMemPoolPtrExportData rxData = {};
   bool acquired = false;
   ncclComm* comm = j->comm;
+  ncclCompressedRsManager* m = op->manager;
+  int next = comm->channels[0].ring.next;
+  size_t arenaBytes = op->stride * NCCL_COMPRESSED_PIPELINE_DEPTH;
+  std::vector<cudaMemPoolPtrExportData> allRxData(comm->nRanks);
   trace(op, "enqueue-begin");
   NCCLCHECKGOTO(ncclStrongStreamAcquire(ncclCudaGraphNone(comm->config.graphUsageMode),
       &comm->sharedRes->deviceStream, false, &cs), ret, fail);
@@ -214,9 +239,23 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
     CUDACHECKGOTO(cudaEventCreateWithFlags(&ready[i], cudaEventDisableTiming), ret, fail);
     CUDACHECKGOTO(cudaEventCreateWithFlags(&done[i], cudaEventDisableTiming), ret, fail);
   }
-  CUDACHECKGOTO(cudaEventCreateWithFlags(&op->complete, cudaEventDisableTiming), ret, fail);
   {
     size_t nblocks = 1 + (j->recvcount - 1) / j->plan.blockElements;
+    if (m->tailRecorded) NCCLCHECKGOTO(wait(cs, m->tail), ret, fail);
+    CUDACHECKGOTO(cudaMallocFromPoolAsync(&op->tx, arenaBytes, m->localPool, cs), ret, fail);
+    CUDACHECKGOTO(cudaMallocFromPoolAsync(&op->rx, arenaBytes, m->localPool, cs), ret, fail);
+    CUDACHECKGOTO(cudaMallocFromPoolAsync(reinterpret_cast<void**>(&op->tasks),
+        sizeof(*op->tasks) * NCCL_COMPRESSED_PIPELINE_DEPTH, m->localPool, cs), ret, fail);
+    CUDACHECKGOTO(cudaMemsetAsync(op->rx, 0, arenaBytes, cs), ret, fail);
+    CUDACHECKGOTO(cudaMemPoolExportPointer(&rxData, op->rx), ret, fail);
+    allRxData[comm->rank] = rxData;
+    NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allRxData.data(), sizeof(rxData)), ret, fail);
+    CUDACHECKGOTO(cudaMemPoolImportPointer(&op->remoteRx, m->nextPool,
+                                           &allRxData[next]), ret, fail);
+    NCCLCHECKGOTO(ncclLaunchCompressedSignal(&m->control->allocationReady,
+                                             op->sequence, cs), ret, fail);
+    NCCLCHECKGOTO(ncclLaunchCompressedWait(&m->remoteControl->allocationReady,
+                                           op->sequence, comm->abortFlagDev, cs), ret, fail);
     NCCLCHECKGOTO(record(done[0], j->stream), ret, fail);
     NCCLCHECKGOTO(wait(cs, done[0]), ret, fail);
     for (size_t w = 0; w < nblocks; w += 2) {
@@ -263,9 +302,22 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
         }
       }
     }
+    CUDACHECKGOTO(cudaFreeAsync(op->remoteRx, cs), ret, fail);
+    op->remoteRx = nullptr;
+    NCCLCHECKGOTO(ncclLaunchCompressedSignal(&m->remoteControl->importFreed,
+                                             op->sequence, cs), ret, fail);
+    NCCLCHECKGOTO(ncclLaunchCompressedWait(&m->control->importFreed,
+                                           op->sequence, comm->abortFlagDev, cs), ret, fail);
+    CUDACHECKGOTO(cudaFreeAsync(op->rx, cs), ret, fail);
+    CUDACHECKGOTO(cudaFreeAsync(op->tx, cs), ret, fail);
+    CUDACHECKGOTO(cudaFreeAsync(op->tasks, cs), ret, fail);
+    op->rx = nullptr;
+    op->tx = nullptr;
+    op->tasks = nullptr;
     NCCLCHECKGOTO(record(ready[0],cs),ret,fail);
     NCCLCHECKGOTO(wait(j->stream,ready[0]),ret,fail);
-    NCCLCHECKGOTO(record(op->complete,j->stream),ret,fail);
+    NCCLCHECKGOTO(record(m->tail,j->stream),ret,fail);
+    m->tailRecorded = true;
   }
 fail:
   if (acquired) {
@@ -288,23 +340,29 @@ static ncclResult_t jobMain(ncclAsyncJob* base) {
   size_t capacity=0;
   if(!op) return ncclSystemError;
   NCCLCHECKGOTO(claim(j->comm,op),ret,fail);
-  NCCLCHECKGOTO(j->plan.maxCompressedBytes(j->plan.blockElements,j->datatype,
-    j->plan.context,&capacity),ret,fail);
-  if(capacity==0 || capacity>UINT32_MAX || capacity>SIZE_MAX-PayloadOffset-SlotAlignment) {
-    ret=ncclInvalidArgument; goto fail;
-  }
-  NCCLCHECKGOTO(allocateExchange(op,capacity),ret,fail);
-  NCCLCHECKGOTO(launch(j,op,capacity,ncclTypeSize(j->datatype)),ret,fail);
   {
-    std::lock_guard<std::mutex> lock(op->manager->mutex);
-    op->manager->cleanup=std::thread(cleanup,op);
+    std::unique_lock<std::mutex> lock(op->manager->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+      WARN("ncclReduceScatterCompressed: concurrent submissions from multiple host threads are unsupported");
+      ret = ncclInvalidUsage;
+      goto fail;
+    }
+    op->sequence = ++op->manager->sequence;
+    NCCLCHECKGOTO(j->plan.maxCompressedBytes(j->plan.blockElements,j->datatype,
+      j->plan.context,&capacity),ret,fail);
+    if(capacity==0 || capacity>UINT32_MAX || capacity>SIZE_MAX-PayloadOffset-SlotAlignment) {
+      ret=ncclInvalidArgument; goto fail;
+    }
+    op->stride = alignUp(PayloadOffset + capacity, SlotAlignment);
+    if (op->stride > SIZE_MAX / NCCL_COMPRESSED_PIPELINE_DEPTH) {
+      ret=ncclInvalidArgument; goto fail;
+    }
+    NCCLCHECKGOTO(initializeManager(op),ret,fail);
+    NCCLCHECKGOTO(launch(j,op,capacity,ncclTypeSize(j->datatype)),ret,fail);
   }
+  delete op;
   return ncclSuccess;
 fail:
-  if(op->manager) {
-    (void)release(op,false);
-    op->manager->active.store(false,std::memory_order_release);
-  }
   delete op;
   return ret;
 }
@@ -314,8 +372,12 @@ static void jobFree(void* p) { delete reinterpret_cast<Job*>(p); }
 ncclResult_t ncclCompressedRsDestroy(ncclComm* comm) {
   ncclCompressedRsManager* m=comm->compressedRsManager;
   if(!m) return ncclSuccess;
-  if(m->cleanup.joinable()) m->cleanup.join();
-  ncclResult_t ret=m->cleanupResult;
+  ncclResult_t ret;
+  {
+    std::lock_guard<std::mutex> lock(m->mutex);
+    ret=destroyManagerResources(comm,m);
+    if(m->tail) CUDACHECKIGNORE(cudaEventDestroy(m->tail));
+  }
   delete m;
   comm->compressedRsManager=nullptr;
   return ret;

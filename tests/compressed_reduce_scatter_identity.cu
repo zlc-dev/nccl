@@ -206,8 +206,10 @@ int runRank(int rank, int nranks, const ncclUniqueId& id, size_t minBytes,
   const size_t sendcount = maxRecvcount * static_cast<size_t>(nranks);
   float* sendbuff = nullptr;
   float* recvbuff = nullptr;
+  int* interopBarrier = nullptr;
   CUDACHECK(cudaMalloc(&sendbuff, sendcount * sizeof(float)));
   CUDACHECK(cudaMalloc(&recvbuff, maxRecvcount * sizeof(float)));
+  CUDACHECK(cudaMalloc(&interopBarrier, sizeof(*interopBarrier)));
 
   ncclCompressionPlan_t plan = NCCL_COMPRESSION_PLAN_INITIALIZER;
   plan.blockElements = BlockElements;
@@ -250,6 +252,14 @@ int runRank(int rank, int nranks, const ncclUniqueId& id, size_t minBytes,
       if (result[i] != expectedValue(nranks, rank, i)) errors++;
     }
 
+    // Exercise a normal NCCL collective immediately after the compressed
+    // operation. This is outside the timed region and guards its completion
+    // boundary and communicator-resource lifetime.
+    CUDACHECK(cudaMemsetAsync(interopBarrier, 0, sizeof(*interopBarrier), stream));
+    NCCLCHECK(ncclAllReduce(interopBarrier, interopBarrier, 1, ncclInt, ncclSum,
+                            comm, stream));
+    CUDACHECK(cudaStreamSynchronize(stream));
+
     RankResult rankResult = {static_cast<float>(totalMs * 1000.0 / iters), errors};
     if (!writeAll(resultFd, &rankResult, sizeof(rankResult))) return EXIT_FAILURE;
     char release = 0;
@@ -261,6 +271,7 @@ int runRank(int rank, int nranks, const ncclUniqueId& id, size_t minBytes,
 
   CUDACHECK(cudaFree(sendbuff));
   CUDACHECK(cudaFree(recvbuff));
+  CUDACHECK(cudaFree(interopBarrier));
   CUDACHECK(cudaEventDestroy(start));
   CUDACHECK(cudaEventDestroy(stop));
   CUDACHECK(cudaStreamDestroy(stream));

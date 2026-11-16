@@ -12,6 +12,11 @@ struct ncclCompressedP2pSlot {
   ncclCompressedFrameHeader_t frame;
 };
 
+struct ncclCompressedP2pControl {
+  uint64_t allocationReady;
+  uint64_t importFreed;
+};
+
 #define NCCL_COMPRESSED_PIPELINE_DEPTH 2
 
 struct ncclComm;
@@ -35,5 +40,12 @@ ncclResult_t ncclLaunchCompressedSend(
 
 ncclResult_t ncclLaunchCompressedRelease(
     void* rxSlot, uint32_t* abortFlag, cudaStream_t stream);
+
+ncclResult_t ncclLaunchCompressedSignal(
+    uint64_t* address, uint64_t value, cudaStream_t stream);
+
+ncclResult_t ncclLaunchCompressedWait(
+    uint64_t* address, uint64_t value,
+    uint32_t* abortFlag, cudaStream_t stream);
 
 #endif
