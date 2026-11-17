@@ -35,7 +35,7 @@ __device__ __forceinline__ void setTaskData(
 __global__ void prepareEncodeAllKernel(
     ncclCompressionTask_t* tasks, void* encoded, size_t slotStride,
     const void* sendbuff, size_t recvcount, size_t blockElements,
-    size_t blockCount, int destination, int typeSize,
+    size_t blockCount, const int* destinations, int typeSize,
     size_t maxPayloadBytes) {
   for (size_t index = blockIdx.x * blockDim.x + threadIdx.x;
        index < blockCount;
@@ -51,7 +51,7 @@ __global__ void prepareEncodeAllKernel(
     task->compressedOutput = payload(encodedSlot);
     task->outputHeader = &frame->frame;
     setTaskData(task, sendbuff, nullptr, recvcount, blockOffset, elementCount,
-                destination, typeSize, maxPayloadBytes);
+                destinations[index], typeSize, maxPayloadBytes);
   }
 }
 
@@ -164,14 +164,14 @@ __global__ __launch_bounds__(512, 1) void sendSlicesKernel(
 ncclResult_t ncclLaunchCompressedPrepareEncodeAll(
     ncclCompressionTask_t* tasks, void* encoded, size_t slotStride,
     const void* sendbuff, size_t recvcount, size_t blockElements,
-    size_t blockCount, int destination, int typeSize,
+    size_t blockCount, const int* destinations, int typeSize,
     size_t maxPayloadBytes, cudaStream_t stream) {
-  if (blockCount == 0 || destination < 0) return ncclInvalidArgument;
+  if (blockCount == 0 || destinations == nullptr) return ncclInvalidArgument;
   constexpr int Threads = 256;
   size_t requiredBlocks = (blockCount + Threads - 1) / Threads;
   int blocks = static_cast<int>(requiredBlocks < 65535 ? requiredBlocks : 65535);
   prepareEncodeAllKernel<<<blocks, Threads, 0, stream>>>(tasks, encoded,
-      slotStride, sendbuff, recvcount, blockElements, blockCount, destination,
+      slotStride, sendbuff, recvcount, blockElements, blockCount, destinations,
       typeSize, maxPayloadBytes);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
