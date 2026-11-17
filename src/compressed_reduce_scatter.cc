@@ -30,6 +30,7 @@ static_assert(sizeof(ncclCompressedRsHostSync) == 64, "slot sync must occupy one
 
 struct ncclCompressedRsHostSyncPage {
   ncclCompressedRsHostSync slots[NCCL_COMPRESSED_PIPELINE_DEPTH];
+  uint64_t importsClosed;
 };
 
 struct ncclCompressedRsManager {
@@ -199,16 +200,26 @@ static ncclResult_t destroyManagerResources(ncclComm* comm, ncclCompressedRsMana
     CUDACHECKGOTO(cudaStreamDestroy(m->recvStream), ret, done);
     m->recvStream = nullptr;
   }
-  // Close imported events before the owner is allowed to destroy the
-  // corresponding exported events.
+  // Drop every imported CUDA object first. The next rank owns these objects,
+  // so publish the Host-side acknowledgement before waiting for the previous
+  // rank to drop the objects exported by this rank.
   for (int s = 0; s < NCCL_COMPRESSED_PIPELINE_DEPTH; s++) {
     if (m->nextSlotEvents[s]) CUDACHECKIGNORE(cudaEventDestroy(m->nextSlotEvents[s]));
     m->nextSlotEvents[s] = nullptr;
   }
+  if (m->nextPool) CUDACHECKIGNORE(cudaMemPoolDestroy(m->nextPool));
+  m->nextPool = nullptr;
+  if (m->initialized && m->nextSync != nullptr)
+    __atomic_store_n(&m->nextSync->importsClosed, 1, __ATOMIC_RELEASE);
+  traceDestroy(comm, "imports-closed");
   if (m->nextSyncHandle) (void)ncclOsShmClose(m->nextSyncHandle);
   m->nextSyncHandle = nullptr;
   m->nextSync = nullptr;
-  traceDestroy(comm, "imports-closed");
+  if (m->initialized && m->localSync != nullptr) {
+    traceDestroy(comm, "peer-imports-wait-begin");
+    NCCLCHECKGOTO(waitHostPhase(comm, &m->localSync->importsClosed, 1), ret, done);
+    traceDestroy(comm, "peer-imports-wait-end");
+  }
 done:
   for (int s = 0; s < NCCL_COMPRESSED_PIPELINE_DEPTH; s++) {
     if (m->nextSlotEvents[s]) CUDACHECKIGNORE(cudaEventDestroy(m->nextSlotEvents[s]));
@@ -224,7 +235,6 @@ done:
   m->localSyncHandle = nullptr;
   m->nextSync = nullptr;
   m->localSync = nullptr;
-  if (m->nextPool) CUDACHECKIGNORE(cudaMemPoolDestroy(m->nextPool));
   if (m->localPool) CUDACHECKIGNORE(cudaMemPoolDestroy(m->localPool));
   m->nextPool = nullptr;
   m->localPool = nullptr;
@@ -291,6 +301,7 @@ static ncclResult_t initializeManager(Operation* op) {
   NCCLCHECKGOTO(ncclOsShmOpen(localInfo.syncPath, sizeof(localInfo.syncPath),
       sizeof(*m->localSync), reinterpret_cast<void**>(&m->localSync), nullptr,
       2, &m->localSyncHandle), ret, fail);
+  __atomic_store_n(&m->localSync->importsClosed, 0, __ATOMIC_RELAXED);
   for (int s = 0; s < NCCL_COMPRESSED_PIPELINE_DEPTH; s++) {
     CUDACHECKGOTO(cudaEventCreateWithFlags(&m->localSlotEvents[s],
         cudaEventDisableTiming | cudaEventInterprocess), ret, fail);
