@@ -396,6 +396,13 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
       }
       for (int s=0;s<slots;s++) {
         NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
+        // The first wave already waited for allocation-ready. Later waves
+        // reuse the same remote RX slots and must wait for the preceding
+        // wave's final RELEASED phase before overwriting them.
+        if (w != 0) {
+          NCCLCHECKGOTO(waitIpcPhase(comm, m->nextSlotEvents[s],
+              &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs), ret, fail);
+        }
         NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
           slot(op->remoteRx,op->stride,s),capacity,cs),ret,fail);
         NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
