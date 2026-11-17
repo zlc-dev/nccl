@@ -55,8 +55,8 @@ struct ncclCompressedRsManager {
 
 namespace {
 constexpr size_t MinBlockBytes = 512 * 1024;
-constexpr size_t TargetSliceBytes = 256 * 1024;
-constexpr int MaxSliceCtas = 8;
+constexpr size_t TargetSliceBytes = 512 * 1024;
+constexpr int MaxSliceCtas = 16;
 constexpr size_t SlotAlignment = 256;
 constexpr size_t PayloadOffset = (sizeof(ncclCompressedP2pSlot) + 15) & ~size_t(15);
 constexpr uint64_t IpcSocketHashSalt = 0x435253504f4f4cULL;
@@ -114,6 +114,13 @@ static void trace(const Operation* op, const char* phase) {
     std::fprintf(stderr, "compressed-rs rank=%d sequence=%llu phase=%s\n",
                  op->comm ? op->comm->rank : -1,
                  static_cast<unsigned long long>(op->sequence), phase);
+    std::fflush(stderr);
+  }
+}
+static void traceDestroy(const ncclComm* comm, const char* phase) {
+  if (traceEnabled()) {
+    std::fprintf(stderr, "compressed-rs rank=%d phase=destroy-%s\n",
+                 comm ? comm->rank : -1, phase);
     std::fflush(stderr);
   }
 }
@@ -180,9 +187,14 @@ static ncclResult_t claim(ncclComm* comm, Operation* op) {
 static ncclResult_t destroyManagerResources(ncclComm* comm, ncclCompressedRsManager* m) {
   ncclResult_t ret = ncclSuccess;
   int savedDev = -1;
+  traceDestroy(comm, "begin");
   CUDACHECKGOTO(cudaGetDevice(&savedDev), ret, done);
   CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), ret, done);
-  if (m->tailRecorded) CUDACHECKGOTO(cudaEventSynchronize(m->tail), ret, done);
+  if (m->tailRecorded) {
+    traceDestroy(comm, "tail-begin");
+    CUDACHECKGOTO(cudaEventSynchronize(m->tail), ret, done);
+    traceDestroy(comm, "tail-end");
+  }
   if (m->recvStream) {
     CUDACHECKGOTO(cudaStreamDestroy(m->recvStream), ret, done);
     m->recvStream = nullptr;
@@ -196,9 +208,7 @@ static ncclResult_t destroyManagerResources(ncclComm* comm, ncclCompressedRsMana
   if (m->nextSyncHandle) (void)ncclOsShmClose(m->nextSyncHandle);
   m->nextSyncHandle = nullptr;
   m->nextSync = nullptr;
-  if (m->initialized && comm->nRanks > 1) {
-    NCCLCHECKGOTO(bootstrapBarrier(comm->bootstrap, comm->rank, comm->nRanks, 0x43525002), ret, done);
-  }
+  traceDestroy(comm, "imports-closed");
 done:
   for (int s = 0; s < NCCL_COMPRESSED_PIPELINE_DEPTH; s++) {
     if (m->nextSlotEvents[s]) CUDACHECKIGNORE(cudaEventDestroy(m->nextSlotEvents[s]));
@@ -221,6 +231,7 @@ done:
   m->tailRecorded = false;
   m->initialized = false;
   if (savedDev >= 0) CUDACHECKIGNORE(cudaSetDevice(savedDev));
+  traceDestroy(comm, "end");
   return ret;
 }
 

@@ -103,8 +103,16 @@ __global__ __launch_bounds__(256, 1) void sendSlicesKernel(
   size_t vectors = static_cast<size_t>(bytes) / sizeof(uint4);
   size_t vectorBegin = vectors * blockIdx.x / gridDim.x;
   size_t vectorEnd = vectors * (blockIdx.x + 1) / gridDim.x;
-  for (size_t i = vectorBegin + threadIdx.x; i < vectorEnd; i += blockDim.x)
-    dst[i] = src[i];
+  constexpr size_t Unroll = 8;
+  size_t i = vectorBegin + threadIdx.x;
+  for (; i + (Unroll - 1) * blockDim.x < vectorEnd; i += Unroll * blockDim.x) {
+    uint4 values[Unroll];
+#pragma unroll
+    for (int u = 0; u < Unroll; u++) values[u] = src[i + u * blockDim.x];
+#pragma unroll
+    for (int u = 0; u < Unroll; u++) dst[i + u * blockDim.x] = values[u];
+  }
+  for (; i < vectorEnd; i += blockDim.x) dst[i] = src[i];
   size_t tail = static_cast<size_t>(bytes) - vectors * sizeof(uint4);
   const char* srcTail = reinterpret_cast<const char*>(src + vectors);
   char* dstTail = reinterpret_cast<char*>(dst + vectors);
