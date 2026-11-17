@@ -11,8 +11,10 @@ Codec interface
 
 Initialize ``ncclCompressionPlan_t`` with
 ``NCCL_COMPRESSION_PLAN_INITIALIZER``. ``blockElements`` is an element count,
-not a byte count. One callback invocation always processes exactly one
-contiguous block (or the final short tail block).
+not a byte count. Each encode task describes one contiguous block (or the
+final short tail block), but NCCL passes all local input tasks to one
+``encode`` callback invocation. Its signature includes ``taskCount`` so the
+codec can encode all segments with one large GPU kernel.
 
 .. code-block:: c
 
@@ -26,15 +28,17 @@ contiguous block (or the final short tail block).
 
 ``maxCompressedBytes`` is a Host callback. Given ``blockElements`` and the
 datatype, it returns the codec's worst-case compressed byte count. The bound
-must also cover every shorter tail block. NCCL uses it only to size two TX and
-two RX slots; the wire transfer uses the actual
+must also cover every shorter tail block. NCCL uses it as the fixed stride
+between pre-encoded frames and to size the pipeline TX/RX slots; the wire
+transfer uses the actual
 ``task.outputHeader->payloadBytes`` written by the codec.
 
-Each codec callback receives one device-resident ``ncclCompressionTask_t`` and
-enqueues its kernel on the supplied stream. It must return without synchronizing
-the GPU and must not retain the task pointer. ``compressedInput`` and
-``compressedOutput`` point directly into the RX and TX P2P slots, so no payload
-workspace or payload copy is inserted around a codec invocation.
+The encode callback receives a device-resident task array. It must produce one
+independent frame per task; adjacent ``compressedOutput`` addresses are spaced
+by the aligned worst-case frame size. Reduction callbacks still receive one
+task at a time and combine the received compressed frame with the corresponding
+original local input. Every callback must return without synchronizing the GPU
+and must not retain task pointers.
 
 If communicator abort is observed while waiting for a frame, NCCL presents an
 empty task with ``elementCount == 0``. Codec callbacks must skip such a task.
@@ -50,19 +54,23 @@ interval is divided only along the element dimension:
 
 ``elementCount = min(blockElements, recvcount - blockOffset)``
 
-There is no channel subdivision and no aggregation of several small tasks into
-one codec launch. For example, with FP32 and ``blockElements=262144``, every full
-codec invocation consumes 1 MiB of uncompressed input. The implementation
+For example, with FP32 and ``blockElements=262144``, every full segment contains
+1 MiB of uncompressed input. The implementation
 rejects calls whose configured full block or complete rank interval is below
 512 KiB; small-message behavior is intentionally out of scope.
 
 Pipeline and transport
 ----------------------
 
-Each GPU has two TX slots and two RX slots. A slot's payload capacity is the
-codec's worst-case size for one full block. For each two-block window:
+Before starting the Ring, NCCL allocates an extra local arena covering every
+block in the destination interval that this rank sends on the first Ring hop,
+then calls ``encode`` once for that complete interval. Other destination
+intervals remain original local input for the reduction callbacks. Each GPU
+also has a bounded set of reusable TX and RX pipeline slots. A slot's payload
+capacity is the codec's worst-case size for one block.
 
-#. ``encode`` writes local source data directly into TX slot 0, then TX slot 1.
+#. The first send of each block reads its frame directly from the pre-encoded
+   arena, without launching or waiting for an encode operation.
 #. A lightweight communication CTA copies only each slot's actual header and
    ``payloadBytes`` into the next rank's RX slot using direct CUDA P2P access.
 #. ``decodeReduceEncode`` reads an RX slot and local original input, then writes

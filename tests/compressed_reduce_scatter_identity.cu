@@ -80,22 +80,31 @@ __global__ void fillInput(float* data, size_t recvcount, int nranks, int sourceR
   }
 }
 
-__global__ void encodeIdentity(const ncclCompressionTask_t* task) {
+__global__ void encodeIdentity(const ncclCompressionTask_t* tasks,
+                               size_t taskCount, int blocksPerTask) {
   extern __shared__ float tile[];
   volatile float* sharedTile = tile;
-  const float* input = static_cast<const float*>(task->localInput);
-  float* output = static_cast<float*>(task->compressedOutput);
-  for (size_t base = blockIdx.x * blockDim.x; base < task->elementCount;
-       base += static_cast<size_t>(gridDim.x) * blockDim.x) {
-    size_t i = base + threadIdx.x;
-    if (i < task->elementCount) sharedTile[threadIdx.x] = input[i];
+  size_t workCount = taskCount * static_cast<size_t>(blocksPerTask);
+  for (size_t work = blockIdx.x; work < workCount; work += gridDim.x) {
+    const ncclCompressionTask_t* task = tasks + work / blocksPerTask;
+    int taskBlock = static_cast<int>(work % blocksPerTask);
+    const float* input = static_cast<const float*>(task->localInput);
+    float* output = static_cast<float*>(task->compressedOutput);
+    for (size_t base = static_cast<size_t>(taskBlock) * blockDim.x;
+         base < task->elementCount;
+         base += static_cast<size_t>(blocksPerTask) * blockDim.x) {
+      size_t i = base + threadIdx.x;
+      if (i < task->elementCount) sharedTile[threadIdx.x] = input[i];
+      __syncthreads();
+      if (i < task->elementCount) output[i] = sharedTile[threadIdx.x];
+      __syncthreads();
+    }
+    if (taskBlock == 0 && threadIdx.x == 0) {
+      task->outputHeader->payloadBytes =
+          static_cast<uint32_t>(task->elementCount * sizeof(float));
+      task->outputHeader->flags = 0;
+    }
     __syncthreads();
-    if (i < task->elementCount) output[i] = sharedTile[threadIdx.x];
-    __syncthreads();
-  }
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    task->outputHeader->payloadBytes = static_cast<uint32_t>(task->elementCount * sizeof(float));
-    task->outputHeader->flags = 0;
   }
 }
 
@@ -157,11 +166,19 @@ ncclResult_t maxIdentityBytes(size_t elementCount, ncclDataType_t datatype,
   return ncclSuccess;
 }
 
-ncclResult_t launchEncode(const ncclCompressionTask_t* task, ncclDataType_t datatype,
+ncclResult_t launchEncode(const ncclCompressionTask_t* tasks, size_t taskCount,
+                          ncclDataType_t datatype,
                           void* context, cudaStream_t stream) {
-  if (datatype != ncclFloat || context == nullptr) return ncclInvalidArgument;
+  if (datatype != ncclFloat || context == nullptr || taskCount == 0)
+    return ncclInvalidArgument;
   const IdentityContext* identity = static_cast<const IdentityContext*>(context);
-  encodeIdentity<<<blocksFor(identity->blockElements), Threads, Threads * sizeof(float), stream>>>(task);
+  int blocksPerTask = blocksFor(identity->blockElements);
+  if (taskCount > SIZE_MAX / static_cast<size_t>(blocksPerTask))
+    return ncclInvalidArgument;
+  size_t workCount = taskCount * static_cast<size_t>(blocksPerTask);
+  int blocks = static_cast<int>(std::min<size_t>(65535, workCount));
+  encodeIdentity<<<blocks, Threads, Threads * sizeof(float), stream>>>(
+      tasks, taskCount, blocksPerTask);
   return cudaGetLastError() == cudaSuccess ? ncclSuccess : ncclUnhandledCudaError;
 }
 

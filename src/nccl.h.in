@@ -512,7 +512,8 @@ typedef struct ncclCompressedFrameHeader {
 
 /*
  * Device-resident task populated by NCCL before invoking a compression callback.
- * One callback invocation processes exactly one contiguous block.
+ * Each task describes exactly one contiguous block. The encode callback receives
+ * an array of tasks; reduction callbacks receive one task.
  */
 typedef struct ncclCompressionTask {
   const void* compressedInput;
@@ -530,8 +531,12 @@ typedef ncclResult_t (*ncclCompressionMaxBytesFn)(
     size_t elementCount, ncclDataType_t datatype, void* context,
     size_t* maxCompressedBytes);
 
+/*
+ * Encode taskCount independent blocks in one launch. NCCL places every
+ * compressed output in a fixed-stride frame sized for the codec's worst case.
+ */
 typedef ncclResult_t (*ncclCompressionEncodeFn)(
-    const ncclCompressionTask_t* task,
+    const ncclCompressionTask_t* tasks, size_t taskCount,
     ncclDataType_t datatype, void* context, cudaStream_t stream);
 
 typedef ncclResult_t (*ncclCompressionDecodeReduceEncodeFn)(

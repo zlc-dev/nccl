@@ -16,10 +16,11 @@ struct ncclCompressedP2pSlot {
 struct ncclComm;
 ncclResult_t ncclCompressedRsDestroy(struct ncclComm* comm);
 
-ncclResult_t ncclLaunchCompressedPrepareEncode(
-    ncclCompressionTask_t* task, void* txSlot, const void* sendbuff,
-    size_t recvcount, size_t blockOffset, size_t elementCount,
-    int destination, int typeSize, size_t maxPayloadBytes, cudaStream_t stream);
+ncclResult_t ncclLaunchCompressedPrepareEncodeAll(
+    ncclCompressionTask_t* tasks, void* encoded, size_t slotStride,
+    const void* sendbuff, size_t recvcount, size_t blockElements,
+    size_t blockCount, int destination, int typeSize,
+    size_t maxPayloadBytes, cudaStream_t stream);
 
 ncclResult_t ncclLaunchCompressedPrepareRound(
     ncclCompressionTask_t* task, void* rxSlot, void* txSlot,

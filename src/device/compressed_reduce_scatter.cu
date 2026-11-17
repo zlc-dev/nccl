@@ -32,19 +32,27 @@ __device__ __forceinline__ void setTaskData(
   task->reserved[1] = 0;
 }
 
-__global__ void prepareEncodeKernel(
-    ncclCompressionTask_t* task, void* txSlot, const void* sendbuff,
-    size_t recvcount, size_t blockOffset, size_t elementCount,
-    int destination, int typeSize, size_t maxPayloadBytes) {
-  if (threadIdx.x != 0) return;
-  ncclCompressedP2pSlot* tx = control(txSlot);
-  tx->frame = {};
-  task->compressedInput = nullptr;
-  task->inputHeader = nullptr;
-  task->compressedOutput = payload(txSlot);
-  task->outputHeader = &tx->frame;
-  setTaskData(task, sendbuff, nullptr, recvcount, blockOffset, elementCount,
-              destination, typeSize, maxPayloadBytes);
+__global__ void prepareEncodeAllKernel(
+    ncclCompressionTask_t* tasks, void* encoded, size_t slotStride,
+    const void* sendbuff, size_t recvcount, size_t blockElements,
+    size_t blockCount, int destination, int typeSize,
+    size_t maxPayloadBytes) {
+  for (size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < blockCount;
+       index += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    size_t blockOffset = index * blockElements;
+    size_t elementCount = min(blockElements, recvcount - blockOffset);
+    void* encodedSlot = static_cast<char*>(encoded) + index * slotStride;
+    ncclCompressedP2pSlot* frame = control(encodedSlot);
+    frame->frame = {};
+    ncclCompressionTask_t* task = tasks + index;
+    task->compressedInput = nullptr;
+    task->inputHeader = nullptr;
+    task->compressedOutput = payload(encodedSlot);
+    task->outputHeader = &frame->frame;
+    setTaskData(task, sendbuff, nullptr, recvcount, blockOffset, elementCount,
+                destination, typeSize, maxPayloadBytes);
+  }
 }
 
 __global__ void prepareRoundKernel(
@@ -153,12 +161,18 @@ __global__ __launch_bounds__(512, 1) void sendSlicesKernel(
 
 } // namespace
 
-ncclResult_t ncclLaunchCompressedPrepareEncode(
-    ncclCompressionTask_t* task, void* txSlot, const void* sendbuff,
-    size_t recvcount, size_t blockOffset, size_t elementCount,
-    int destination, int typeSize, size_t maxPayloadBytes, cudaStream_t stream) {
-  prepareEncodeKernel<<<1, 1, 0, stream>>>(task, txSlot, sendbuff, recvcount,
-      blockOffset, elementCount, destination, typeSize, maxPayloadBytes);
+ncclResult_t ncclLaunchCompressedPrepareEncodeAll(
+    ncclCompressionTask_t* tasks, void* encoded, size_t slotStride,
+    const void* sendbuff, size_t recvcount, size_t blockElements,
+    size_t blockCount, int destination, int typeSize,
+    size_t maxPayloadBytes, cudaStream_t stream) {
+  if (blockCount == 0 || destination < 0) return ncclInvalidArgument;
+  constexpr int Threads = 256;
+  size_t requiredBlocks = (blockCount + Threads - 1) / Threads;
+  int blocks = static_cast<int>(requiredBlocks < 65535 ? requiredBlocks : 65535);
+  prepareEncodeAllKernel<<<blocks, Threads, 0, stream>>>(tasks, encoded,
+      slotStride, sendbuff, recvcount, blockElements, blockCount, destination,
+      typeSize, maxPayloadBytes);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }
