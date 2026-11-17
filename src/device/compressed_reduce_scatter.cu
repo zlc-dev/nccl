@@ -79,7 +79,7 @@ __global__ void prepareRoundKernel(
   }
 }
 
-__global__ __launch_bounds__(256, 1) void sendSlicesKernel(
+__global__ __launch_bounds__(512, 1) void sendSlicesKernel(
     void* txSlot, void* remoteRxSlot, size_t maxPayloadBytes) {
   __shared__ uint32_t bytes;
   ncclCompressedP2pSlot* tx = control(txSlot);
@@ -98,24 +98,33 @@ __global__ __launch_bounds__(256, 1) void sendSlicesKernel(
   }
   __syncthreads();
 
-  const uint4* src = reinterpret_cast<const uint4*>(payload(txSlot));
-  uint4* dst = reinterpret_cast<uint4*>(payload(remoteRxSlot));
-  size_t vectors = static_cast<size_t>(bytes) / sizeof(uint4);
-  size_t vectorBegin = vectors * blockIdx.x / gridDim.x;
-  size_t vectorEnd = vectors * (blockIdx.x + 1) / gridDim.x;
+  constexpr size_t PackBytes = 16;
   constexpr size_t Unroll = 8;
-  size_t i = vectorBegin + threadIdx.x;
-  for (; i + (Unroll - 1) * blockDim.x < vectorEnd; i += Unroll * blockDim.x) {
-    uint4 values[Unroll];
+  uintptr_t src = cvta_to_global(payload(txSlot));
+  uintptr_t dst = cvta_to_global(payload(remoteRxSlot));
+  size_t packs = static_cast<size_t>(bytes) / PackBytes;
+  size_t packBegin = packs * blockIdx.x / gridDim.x;
+  size_t packEnd = packs * (blockIdx.x + 1) / gridDim.x;
+  size_t i = packBegin + threadIdx.x;
+  for (; i + (Unroll - 1) * blockDim.x < packEnd;
+       i += Unroll * blockDim.x) {
+    BytePack<PackBytes> values[Unroll];
 #pragma unroll
-    for (int u = 0; u < Unroll; u++) values[u] = src[i + u * blockDim.x];
+    for (int u = 0; u < Unroll; u++)
+      values[u] = ld_volatile_global<PackBytes>(
+          src + (i + u * blockDim.x) * PackBytes);
 #pragma unroll
-    for (int u = 0; u < Unroll; u++) dst[i + u * blockDim.x] = values[u];
+    for (int u = 0; u < Unroll; u++)
+      st_global<PackBytes>(dst + (i + u * blockDim.x) * PackBytes, values[u]);
   }
-  for (; i < vectorEnd; i += blockDim.x) dst[i] = src[i];
-  size_t tail = static_cast<size_t>(bytes) - vectors * sizeof(uint4);
-  const char* srcTail = reinterpret_cast<const char*>(src + vectors);
-  char* dstTail = reinterpret_cast<char*>(dst + vectors);
+  for (; i < packEnd; i += blockDim.x) {
+    BytePack<PackBytes> value =
+        ld_volatile_global<PackBytes>(src + i * PackBytes);
+    st_global<PackBytes>(dst + i * PackBytes, value);
+  }
+  size_t tail = static_cast<size_t>(bytes) - packs * PackBytes;
+  const char* srcTail = reinterpret_cast<const char*>(src + packs * PackBytes);
+  char* dstTail = reinterpret_cast<char*>(dst + packs * PackBytes);
   if (blockIdx.x + 1 == gridDim.x)
     for (size_t i = threadIdx.x; i < tail; i += blockDim.x)
       dstTail[i] = srcTail[i];
@@ -149,7 +158,7 @@ ncclResult_t ncclLaunchCompressedSend(
     void* txSlot, void* remoteRxSlot, size_t maxPayloadBytes,
     int sliceCount, cudaStream_t stream) {
   if (sliceCount < 1) return ncclInvalidArgument;
-  sendSlicesKernel<<<sliceCount, 256, 0, stream>>>(
+  sendSlicesKernel<<<sliceCount, 512, 0, stream>>>(
       txSlot, remoteRxSlot, maxPayloadBytes);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;

@@ -56,7 +56,7 @@ struct ncclCompressedRsManager {
 namespace {
 constexpr size_t MinBlockBytes = 512 * 1024;
 constexpr size_t TargetSliceBytes = 512 * 1024;
-constexpr int MaxSliceCtas = 16;
+constexpr int MaxSliceCtas = 4;
 constexpr size_t SlotAlignment = 256;
 constexpr size_t PayloadOffset = (sizeof(ncclCompressedP2pSlot) + 15) & ~size_t(15);
 constexpr uint64_t IpcSocketHashSalt = 0x435253504f4f4cULL;
