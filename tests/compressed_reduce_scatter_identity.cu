@@ -35,7 +35,8 @@
 
 namespace {
 
-constexpr size_t DefaultBlockBytes = 512 * 1024;
+constexpr size_t MinBlockBytes = 512 * 1024;
+constexpr size_t DefaultBlockBytes = 1024 * 1024;
 constexpr int Threads = 256;
 
 struct RankResult {
@@ -330,11 +331,11 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "Need 2..%d GPUs, requested %d\n", visibleDevices, nranks);
     return 77;
   }
-  minBytes = std::max(minBytes, DefaultBlockBytes);
+  minBytes = std::max(minBytes, MinBlockBytes);
   minBytes -= minBytes % sizeof(float);
   maxBytes -= maxBytes % sizeof(float);
   blockBytes -= blockBytes % sizeof(float);
-  if (maxBytes < minBytes || blockBytes < DefaultBlockBytes ||
+  if (maxBytes < minBytes || blockBytes < MinBlockBytes ||
       blockBytes > UINT32_MAX - UINT32_MAX % sizeof(float) ||
       stepFactor < 2 || warmupIters < 0 || iters < 1) return EXIT_FAILURE;
   size_t blockElements = blockBytes / sizeof(float);
