@@ -57,7 +57,9 @@ struct ncclCompressedRsManager {
 namespace {
 constexpr size_t MinBlockBytes = 512 * 1024;
 constexpr size_t TargetSliceBytes = 256 * 1024;
+constexpr size_t TargetGroupBytes = 8 * 1024 * 1024;
 constexpr int MaxSliceCtas = 4;
+constexpr int MaxSegmentsPerSlot = 8;
 constexpr size_t SlotAlignment = 256;
 constexpr size_t PayloadOffset = (sizeof(ncclCompressedP2pSlot) + 15) & ~size_t(15);
 constexpr uint64_t IpcSocketHashSalt = 0x435253504f4f4cULL;
@@ -92,6 +94,7 @@ struct Job {
 
 struct SlotState {
   size_t block = 0;
+  int segments = 0;
   int round = 0;
   bool active = false;
 };
@@ -203,12 +206,16 @@ static ncclResult_t destroyManagerResources(ncclComm* comm, ncclCompressedRsMana
   // Drop every imported CUDA object first. The next rank owns these objects,
   // so publish the Host-side acknowledgement before waiting for the previous
   // rank to drop the objects exported by this rank.
+  traceDestroy(comm, "imported-events-close-begin");
   for (int s = 0; s < NCCL_COMPRESSED_PIPELINE_DEPTH; s++) {
     if (m->nextSlotEvents[s]) CUDACHECKIGNORE(cudaEventDestroy(m->nextSlotEvents[s]));
     m->nextSlotEvents[s] = nullptr;
   }
+  traceDestroy(comm, "imported-events-close-end");
+  traceDestroy(comm, "imported-pool-close-begin");
   if (m->nextPool) CUDACHECKIGNORE(cudaMemPoolDestroy(m->nextPool));
   m->nextPool = nullptr;
+  traceDestroy(comm, "imported-pool-close-end");
   if (m->initialized && m->nextSync != nullptr)
     __atomic_store_n(&m->nextSync->importsClosed, 1, __ATOMIC_RELEASE);
   traceDestroy(comm, "imports-closed");
@@ -221,6 +228,7 @@ static ncclResult_t destroyManagerResources(ncclComm* comm, ncclCompressedRsMana
     traceDestroy(comm, "peer-imports-wait-end");
   }
 done:
+  traceDestroy(comm, "local-events-close-begin");
   for (int s = 0; s < NCCL_COMPRESSED_PIPELINE_DEPTH; s++) {
     if (m->nextSlotEvents[s]) CUDACHECKIGNORE(cudaEventDestroy(m->nextSlotEvents[s]));
     if (m->localSlotEvents[s]) CUDACHECKIGNORE(cudaEventDestroy(m->localSlotEvents[s]));
@@ -229,13 +237,16 @@ done:
     m->localSlotPhase[s] = 0;
     m->nextSlotPhase[s] = 0;
   }
+  traceDestroy(comm, "local-events-close-end");
   if (m->nextSyncHandle) (void)ncclOsShmClose(m->nextSyncHandle);
   if (m->localSyncHandle) (void)ncclOsShmClose(m->localSyncHandle);
   m->nextSyncHandle = nullptr;
   m->localSyncHandle = nullptr;
   m->nextSync = nullptr;
   m->localSync = nullptr;
+  traceDestroy(comm, "local-pool-close-begin");
   if (m->localPool) CUDACHECKIGNORE(cudaMemPoolDestroy(m->localPool));
+  traceDestroy(comm, "local-pool-close-end");
   m->nextPool = nullptr;
   m->localPool = nullptr;
   m->tailRecorded = false;
@@ -363,9 +374,13 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
   ncclComm* comm = j->comm;
   ncclCompressedRsManager* m = op->manager;
   int next = comm->channels[0].ring.next;
-  int sliceCtas = std::max(1, std::min<int>(MaxSliceCtas,
+  int ctasPerSegment = std::max(1, std::min<int>(MaxSliceCtas,
       static_cast<int>((capacity + TargetSliceBytes - 1) / TargetSliceBytes)));
-  size_t arenaBytes = op->stride * NCCL_COMPRESSED_PIPELINE_DEPTH;
+  int segmentsPerSlot = std::max(1, std::min<int>(MaxSegmentsPerSlot,
+      static_cast<int>(TargetGroupBytes / std::max<size_t>(capacity, 1))));
+  size_t arenaSlots = static_cast<size_t>(NCCL_COMPRESSED_PIPELINE_DEPTH) * segmentsPerSlot;
+  if (op->stride > SIZE_MAX / arenaSlots) return ncclInvalidArgument;
+  size_t arenaBytes = op->stride * arenaSlots;
   std::vector<cudaMemPoolPtrExportData> allRxData(comm->nRanks);
   trace(op, "enqueue-begin");
   NCCLCHECKGOTO(ncclStrongStreamAcquire(ncclCudaGraphNone(comm->config.graphUsageMode),
@@ -380,7 +395,8 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
   {
     size_t nblocks = 1 + (j->recvcount - 1) / j->plan.blockElements;
     int activeSlots = static_cast<int>(std::min<size_t>(
-        NCCL_COMPRESSED_PIPELINE_DEPTH, nblocks));
+        NCCL_COMPRESSED_PIPELINE_DEPTH,
+        (nblocks + segmentsPerSlot - 1) / segmentsPerSlot));
     if (m->tailRecorded) NCCLCHECKGOTO(wait(cs, m->tail), ret, fail);
     // Slot 0 carries the previous operation's allocation-free ack. Consume it
     // before this operation publishes a new allocation-ready phase.
@@ -391,7 +407,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
     CUDACHECKGOTO(cudaMallocFromPoolAsync(&op->tx, arenaBytes, m->localPool, cs), ret, fail);
     CUDACHECKGOTO(cudaMallocFromPoolAsync(&op->rx, arenaBytes, m->localPool, cs), ret, fail);
     CUDACHECKGOTO(cudaMallocFromPoolAsync(reinterpret_cast<void**>(&op->tasks),
-        sizeof(*op->tasks) * NCCL_COMPRESSED_PIPELINE_DEPTH, m->localPool, cs), ret, fail);
+        sizeof(*op->tasks) * arenaSlots, m->localPool, cs), ret, fail);
     CUDACHECKGOTO(cudaMemsetAsync(op->rx, 0, arenaBytes, cs), ret, fail);
     CUDACHECKGOTO(cudaMemPoolExportPointer(&rxData, op->rx), ret, fail);
     allRxData[comm->rank] = rxData;
@@ -414,24 +430,38 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
     NCCLCHECKGOTO(record(done[0], j->stream), ret, fail);
     NCCLCHECKGOTO(wait(cs, done[0]), ret, fail);
     SlotState states[NCCL_COMPRESSED_PIPELINE_DEPTH] = {};
-    size_t nextBlock = static_cast<size_t>(activeSlots);
+    size_t nextBlock = 0;
     int active = activeSlots;
     for (int s = 0; s < activeSlots; s++) {
-      states[s].block = static_cast<size_t>(s);
+      states[s].block = nextBlock;
+      states[s].segments = static_cast<int>(std::min<size_t>(
+          segmentsPerSlot, nblocks - nextBlock));
+      nextBlock += states[s].segments;
       states[s].active = true;
-      size_t off = states[s].block*j->plan.blockElements;
-      size_t count = std::min(j->plan.blockElements, j->recvcount-off);
       int dst = comm->channels[0].ring.userRanks[comm->nRanks-1];
-      NCCLCHECKGOTO(ncclLaunchCompressedPrepareEncode(op->tasks+s, slot(op->tx,op->stride,s),
-        j->sendbuff,j->recvcount,off,count,dst,typeSize,capacity,cs), ret, fail);
+      for (int q = 0; q < states[s].segments; q++) {
+        size_t index = static_cast<size_t>(s) * segmentsPerSlot + q;
+        size_t off = (states[s].block + q) * j->plan.blockElements;
+        size_t count = std::min(j->plan.blockElements, j->recvcount-off);
+        NCCLCHECKGOTO(ncclLaunchCompressedPrepareEncode(op->tasks+index,
+          slot(op->tx,op->stride,index),j->sendbuff,j->recvcount,off,count,dst,
+          typeSize,capacity,cs), ret, fail);
+      }
       NCCLCHECKGOTO(record(ready[s],cs),ret,fail); NCCLCHECKGOTO(wait(j->stream,ready[s]),ret,fail);
-      NCCLCHECKGOTO(j->plan.encode(op->tasks+s,j->datatype,j->plan.context,j->stream),ret,fail);
+      for (int q = 0; q < states[s].segments; q++) {
+        size_t index = static_cast<size_t>(s) * segmentsPerSlot + q;
+        NCCLCHECKGOTO(j->plan.encode(op->tasks+index,j->datatype,
+          j->plan.context,j->stream),ret,fail);
+      }
       NCCLCHECKGOTO(record(done[s],j->stream),ret,fail);
     }
     for (int s=0;s<activeSlots;s++) {
       NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
-      NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
-        slot(op->remoteRx,op->stride,s),capacity,sliceCtas,cs),ret,fail);
+      size_t index = static_cast<size_t>(s) * segmentsPerSlot;
+      int sendCtas = std::min(MaxSliceCtas, states[s].segments * ctasPerSegment);
+      NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,index),
+        slot(op->remoteRx,op->stride,index),op->stride,capacity,
+        states[s].segments,sendCtas,cs),ret,fail);
       NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
           &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
       NCCLCHECKGOTO(record(sendDone[s],cs),ret,fail);
@@ -442,8 +472,6 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           int r = states[s].round;
           bool final = r+1 == comm->nRanks-1;
           int dst = comm->channels[0].ring.userRanks[comm->nRanks-2-r];
-          size_t off=states[s].block*j->plan.blockElements;
-          size_t count=std::min(j->plan.blockElements,j->recvcount-off);
           NCCLCHECKGOTO(wait(m->recvStream,done[s]),ret,fail);
           NCCLCHECKGOTO(waitIpcPhase(comm, m->localSlotEvents[s],
               &m->localSync->slots[s], ++m->localSlotPhase[s],
@@ -452,15 +480,24 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           // Protect the entire TX slot, not only the codec payload write,
           // from racing the preceding send kernel.
           if (!final) NCCLCHECKGOTO(wait(m->recvStream,sendDone[s]),ret,fail);
-          NCCLCHECKGOTO(ncclLaunchCompressedPrepareRound(op->tasks+s,slot(op->rx,op->stride,s),
-            slot(op->tx,op->stride,s),!final,j->sendbuff,final?j->recvbuff:nullptr,j->recvcount,
-            off,count,dst,typeSize,capacity,m->recvStream),ret,fail);
+          for (int q = 0; q < states[s].segments; q++) {
+            size_t index = static_cast<size_t>(s) * segmentsPerSlot + q;
+            size_t off = (states[s].block + q) * j->plan.blockElements;
+            size_t count = std::min(j->plan.blockElements, j->recvcount-off);
+            NCCLCHECKGOTO(ncclLaunchCompressedPrepareRound(op->tasks+index,
+              slot(op->rx,op->stride,index),slot(op->tx,op->stride,index),
+              !final,j->sendbuff,final?j->recvbuff:nullptr,j->recvcount,
+              off,count,dst,typeSize,capacity,m->recvStream),ret,fail);
+          }
           NCCLCHECKGOTO(record(ready[s],m->recvStream),ret,fail);
           NCCLCHECKGOTO(wait(j->stream,ready[s]),ret,fail);
-          if (final) NCCLCHECKGOTO(j->plan.decodeReduceCopy(op->tasks+s,j->datatype,j->op,
-              j->plan.context,j->stream),ret,fail);
-          else NCCLCHECKGOTO(j->plan.decodeReduceEncode(op->tasks+s,j->datatype,j->op,
-              j->plan.context,j->stream),ret,fail);
+          for (int q = 0; q < states[s].segments; q++) {
+            size_t index = static_cast<size_t>(s) * segmentsPerSlot + q;
+            if (final) NCCLCHECKGOTO(j->plan.decodeReduceCopy(op->tasks+index,
+                j->datatype,j->op,j->plan.context,j->stream),ret,fail);
+            else NCCLCHECKGOTO(j->plan.decodeReduceEncode(op->tasks+index,
+                j->datatype,j->op,j->plan.context,j->stream),ret,fail);
+          }
           NCCLCHECKGOTO(recordIpcPhase(comm, m->localSlotEvents[s],
               &m->localSync->slots[s], ++m->localSlotPhase[s],
               j->stream),ret,fail);
@@ -469,8 +506,12 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
             NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
             NCCLCHECKGOTO(waitIpcPhase(comm, m->nextSlotEvents[s],
                 &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
-            NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
-              slot(op->remoteRx,op->stride,s),capacity,sliceCtas,cs),ret,fail);
+            size_t index = static_cast<size_t>(s) * segmentsPerSlot;
+            int sendCtas = std::min(MaxSliceCtas,
+                states[s].segments * ctasPerSegment);
+            NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,index),
+              slot(op->remoteRx,op->stride,index),op->stride,capacity,
+              states[s].segments,sendCtas,cs),ret,fail);
             NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
                 &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
             NCCLCHECKGOTO(record(sendDone[s],cs),ret,fail);
@@ -478,25 +519,40 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           } else if (nextBlock < nblocks) {
             // This physical slot is now free. Refill and send it immediately
             // instead of draining the other slot and ending a two-block wave.
-            states[s].block = nextBlock++;
+            states[s].block = nextBlock;
+            states[s].segments = static_cast<int>(std::min<size_t>(
+                segmentsPerSlot, nblocks - states[s].block));
+            nextBlock = states[s].block + states[s].segments;
             states[s].round = 0;
-            off = states[s].block*j->plan.blockElements;
-            count = std::min(j->plan.blockElements, j->recvcount-off);
             dst = comm->channels[0].ring.userRanks[comm->nRanks-1];
             NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
-            NCCLCHECKGOTO(ncclLaunchCompressedPrepareEncode(op->tasks+s,
-              slot(op->tx,op->stride,s),j->sendbuff,j->recvcount,off,count,dst,
-              typeSize,capacity,cs),ret,fail);
+            for (int q = 0; q < states[s].segments; q++) {
+              size_t index = static_cast<size_t>(s) * segmentsPerSlot + q;
+              size_t off = (states[s].block + q) * j->plan.blockElements;
+              size_t count = std::min(j->plan.blockElements,j->recvcount-off);
+              NCCLCHECKGOTO(ncclLaunchCompressedPrepareEncode(op->tasks+index,
+                slot(op->tx,op->stride,index),j->sendbuff,j->recvcount,off,count,
+                dst,typeSize,capacity,cs),ret,fail);
+            }
             NCCLCHECKGOTO(record(ready[s],cs),ret,fail);
             NCCLCHECKGOTO(wait(j->stream,ready[s]),ret,fail);
-            NCCLCHECKGOTO(j->plan.encode(op->tasks+s,j->datatype,
-              j->plan.context,j->stream),ret,fail);
+            for (int q = 0; q < states[s].segments; q++) {
+              size_t index = static_cast<size_t>(s) * segmentsPerSlot + q;
+              NCCLCHECKGOTO(j->plan.encode(op->tasks+index,j->datatype,
+                j->plan.context,j->stream),ret,fail);
+            }
             NCCLCHECKGOTO(record(done[s],j->stream),ret,fail);
             NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
             NCCLCHECKGOTO(waitIpcPhase(comm, m->nextSlotEvents[s],
               &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
-            NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
-              slot(op->remoteRx,op->stride,s),capacity,sliceCtas,cs),ret,fail);
+            {
+              size_t index = static_cast<size_t>(s) * segmentsPerSlot;
+              int sendCtas = std::min(MaxSliceCtas,
+                  states[s].segments * ctasPerSegment);
+              NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,index),
+                slot(op->remoteRx,op->stride,index),op->stride,capacity,
+                states[s].segments,sendCtas,cs),ret,fail);
+            }
             NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
               &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
             NCCLCHECKGOTO(record(sendDone[s],cs),ret,fail);

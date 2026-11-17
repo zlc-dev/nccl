@@ -279,13 +279,16 @@ int runRank(int rank, int nranks, const ncclUniqueId& id, size_t minBytes,
     bytes *= static_cast<size_t>(stepFactor);
   }
 
-  CUDACHECK(cudaFree(sendbuff));
-  CUDACHECK(cudaFree(recvbuff));
-  CUDACHECK(cudaFree(interopBarrier));
+  // The compressed communicator owns tail events recorded on the user stream.
+  // Tear it down while that stream and all buffers referenced by submitted
+  // work are still alive.
+  NCCLCHECK(ncclCommDestroy(comm));
   CUDACHECK(cudaEventDestroy(start));
   CUDACHECK(cudaEventDestroy(stop));
   CUDACHECK(cudaStreamDestroy(stream));
-  NCCLCHECK(ncclCommDestroy(comm));
+  CUDACHECK(cudaFree(sendbuff));
+  CUDACHECK(cudaFree(recvbuff));
+  CUDACHECK(cudaFree(interopBarrier));
   return passed ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
