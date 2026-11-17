@@ -55,6 +55,8 @@ struct ncclCompressedRsManager {
 
 namespace {
 constexpr size_t MinBlockBytes = 512 * 1024;
+constexpr size_t TargetSliceBytes = 256 * 1024;
+constexpr int MaxSliceCtas = 8;
 constexpr size_t SlotAlignment = 256;
 constexpr size_t PayloadOffset = (sizeof(ncclCompressedP2pSlot) + 15) & ~size_t(15);
 constexpr uint64_t IpcSocketHashSalt = 0x435253504f4f4cULL;
@@ -339,6 +341,8 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
   ncclComm* comm = j->comm;
   ncclCompressedRsManager* m = op->manager;
   int next = comm->channels[0].ring.next;
+  int sliceCtas = std::max(1, std::min<int>(MaxSliceCtas,
+      static_cast<int>((capacity + TargetSliceBytes - 1) / TargetSliceBytes)));
   size_t arenaBytes = op->stride * NCCL_COMPRESSED_PIPELINE_DEPTH;
   std::vector<cudaMemPoolPtrExportData> allRxData(comm->nRanks);
   trace(op, "enqueue-begin");
@@ -405,7 +409,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
     for (int s=0;s<activeSlots;s++) {
       NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
       NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
-        slot(op->remoteRx,op->stride,s),capacity,cs),ret,fail);
+        slot(op->remoteRx,op->stride,s),capacity,sliceCtas,cs),ret,fail);
       NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
           &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
       NCCLCHECKGOTO(record(sendDone[s],cs),ret,fail);
@@ -444,7 +448,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
             NCCLCHECKGOTO(waitIpcPhase(comm, m->nextSlotEvents[s],
                 &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
             NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
-              slot(op->remoteRx,op->stride,s),capacity,cs),ret,fail);
+              slot(op->remoteRx,op->stride,s),capacity,sliceCtas,cs),ret,fail);
             NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
                 &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
             NCCLCHECKGOTO(record(sendDone[s],cs),ret,fail);
@@ -470,7 +474,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
             NCCLCHECKGOTO(waitIpcPhase(comm, m->nextSlotEvents[s],
               &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
             NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
-              slot(op->remoteRx,op->stride,s),capacity,cs),ret,fail);
+              slot(op->remoteRx,op->stride,s),capacity,sliceCtas,cs),ret,fail);
             NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
               &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
             NCCLCHECKGOTO(record(sendDone[s],cs),ret,fail);

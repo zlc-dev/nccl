@@ -79,7 +79,7 @@ __global__ void prepareRoundKernel(
   }
 }
 
-__global__ __launch_bounds__(256, 1) void sendKernel(
+__global__ __launch_bounds__(256, 1) void sendSlicesKernel(
     void* txSlot, void* remoteRxSlot, size_t maxPayloadBytes) {
   __shared__ uint32_t bytes;
   ncclCompressedP2pSlot* tx = control(txSlot);
@@ -88,22 +88,29 @@ __global__ __launch_bounds__(256, 1) void sendKernel(
   if (threadIdx.x == 0) {
     bytes = tx->frame.payloadBytes;
     if (bytes > maxPayloadBytes) {
-      tx->frame.flags |= NCCL_COMPRESSED_FRAME_FLAG_SIZE_ERROR;
       bytes = 0;
-      tx->frame.payloadBytes = 0;
+      if (blockIdx.x == 0) {
+        tx->frame.flags |= NCCL_COMPRESSED_FRAME_FLAG_SIZE_ERROR;
+        tx->frame.payloadBytes = 0;
+      }
     }
-    rx->frame = tx->frame;
+    if (blockIdx.x == 0) rx->frame = tx->frame;
   }
   __syncthreads();
 
   const uint4* src = reinterpret_cast<const uint4*>(payload(txSlot));
   uint4* dst = reinterpret_cast<uint4*>(payload(remoteRxSlot));
   size_t vectors = static_cast<size_t>(bytes) / sizeof(uint4);
-  for (size_t i = threadIdx.x; i < vectors; i += blockDim.x) dst[i] = src[i];
+  size_t vectorBegin = vectors * blockIdx.x / gridDim.x;
+  size_t vectorEnd = vectors * (blockIdx.x + 1) / gridDim.x;
+  for (size_t i = vectorBegin + threadIdx.x; i < vectorEnd; i += blockDim.x)
+    dst[i] = src[i];
   size_t tail = static_cast<size_t>(bytes) - vectors * sizeof(uint4);
   const char* srcTail = reinterpret_cast<const char*>(src + vectors);
   char* dstTail = reinterpret_cast<char*>(dst + vectors);
-  for (size_t i = threadIdx.x; i < tail; i += blockDim.x) dstTail[i] = srcTail[i];
+  if (blockIdx.x + 1 == gridDim.x)
+    for (size_t i = threadIdx.x; i < tail; i += blockDim.x)
+      dstTail[i] = srcTail[i];
 }
 
 } // namespace
@@ -132,8 +139,10 @@ ncclResult_t ncclLaunchCompressedPrepareRound(
 
 ncclResult_t ncclLaunchCompressedSend(
     void* txSlot, void* remoteRxSlot, size_t maxPayloadBytes,
-    cudaStream_t stream) {
-  sendKernel<<<1, 256, 0, stream>>>(txSlot, remoteRxSlot, maxPayloadBytes);
+    int sliceCount, cudaStream_t stream) {
+  if (sliceCount < 1) return ncclInvalidArgument;
+  sendSlicesKernel<<<sliceCount, 256, 0, stream>>>(
+      txSlot, remoteRxSlot, maxPayloadBytes);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }

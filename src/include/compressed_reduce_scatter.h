@@ -30,6 +30,6 @@ ncclResult_t ncclLaunchCompressedPrepareRound(
 
 ncclResult_t ncclLaunchCompressedSend(
     void* txSlot, void* remoteRxSlot,
-    size_t maxPayloadBytes, cudaStream_t stream);
+    size_t maxPayloadBytes, int sliceCount, cudaStream_t stream);
 
 #endif
