@@ -8,13 +8,7 @@
 #include "nccl.h"
 
 struct ncclCompressedP2pSlot {
-  uint64_t state;
   ncclCompressedFrameHeader_t frame;
-};
-
-struct ncclCompressedP2pControl {
-  uint64_t allocationReady;
-  uint64_t importFreed;
 };
 
 #define NCCL_COMPRESSED_PIPELINE_DEPTH 2
@@ -32,20 +26,10 @@ ncclResult_t ncclLaunchCompressedPrepareRound(
     bool prepareSend, const void* sendbuff, void* recvbuff,
     size_t recvcount, size_t blockOffset, size_t elementCount,
     int destination, int typeSize,
-    size_t maxPayloadBytes, uint32_t* abortFlag, cudaStream_t stream);
+    size_t maxPayloadBytes, cudaStream_t stream);
 
 ncclResult_t ncclLaunchCompressedSend(
     void* txSlot, void* remoteRxSlot,
-    size_t maxPayloadBytes, uint32_t* abortFlag, cudaStream_t stream);
-
-ncclResult_t ncclLaunchCompressedRelease(
-    void* rxSlot, uint32_t* abortFlag, cudaStream_t stream);
-
-ncclResult_t ncclLaunchCompressedSignal(
-    uint64_t* address, uint64_t value, cudaStream_t stream);
-
-ncclResult_t ncclLaunchCompressedWait(
-    uint64_t* address, uint64_t value,
-    uint32_t* abortFlag, cudaStream_t stream);
+    size_t maxPayloadBytes, cudaStream_t stream);
 
 #endif

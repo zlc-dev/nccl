@@ -9,13 +9,7 @@
 
 namespace {
 
-constexpr uint64_t SlotFree = 0;
-constexpr uint64_t SlotReady = 1;
 constexpr size_t PayloadOffset = (sizeof(ncclCompressedP2pSlot) + 15) & ~size_t(15);
-
-__device__ __forceinline__ bool isAborted(uint32_t* abortFlag) {
-  return abortFlag != nullptr && loadInt(reinterpret_cast<int*>(abortFlag)) != 0;
-}
 
 __device__ __forceinline__ char* payload(void* slot) {
   return static_cast<char*>(slot) + PayloadOffset;
@@ -56,8 +50,7 @@ __global__ void prepareEncodeKernel(
 __global__ void prepareRoundKernel(
     ncclCompressionTask_t* task, void* rxSlot, void* txSlot, bool prepareSend,
     const void* sendbuff, void* recvbuff, size_t recvcount, size_t blockOffset,
-    size_t elementCount, int destination, int typeSize, size_t maxPayloadBytes,
-    uint32_t* abortFlag) {
+    size_t elementCount, int destination, int typeSize, size_t maxPayloadBytes) {
   ncclCompressedP2pSlot* rx = control(rxSlot);
   if (threadIdx.x == 0) {
     task->compressedInput = nullptr;
@@ -68,9 +61,6 @@ __global__ void prepareRoundKernel(
     task->output = nullptr;
     task->elementCount = 0;
     task->compressedCapacity = maxPayloadBytes;
-    while (ld_volatile_global(&rx->state) != SlotReady && !isAborted(abortFlag));
-    if (isAborted(abortFlag)) return;
-    fence_acq_rel_sys();
     if (rx->frame.payloadBytes > maxPayloadBytes)
       rx->frame.flags |= NCCL_COMPRESSED_FRAME_FLAG_SIZE_ERROR;
     task->compressedInput = payload(rxSlot);
@@ -90,14 +80,12 @@ __global__ void prepareRoundKernel(
 }
 
 __global__ __launch_bounds__(256, 1) void sendKernel(
-    void* txSlot, void* remoteRxSlot, size_t maxPayloadBytes, uint32_t* abortFlag) {
+    void* txSlot, void* remoteRxSlot, size_t maxPayloadBytes) {
   __shared__ uint32_t bytes;
   ncclCompressedP2pSlot* tx = control(txSlot);
   ncclCompressedP2pSlot* rx = control(remoteRxSlot);
 
   if (threadIdx.x == 0) {
-    while (ld_volatile_global(&rx->state) != SlotFree && !isAborted(abortFlag));
-    fence_acq_rel_sys();
     bytes = tx->frame.payloadBytes;
     if (bytes > maxPayloadBytes) {
       tx->frame.flags |= NCCL_COMPRESSED_FRAME_FLAG_SIZE_ERROR;
@@ -107,7 +95,6 @@ __global__ __launch_bounds__(256, 1) void sendKernel(
     rx->frame = tx->frame;
   }
   __syncthreads();
-  if (isAborted(abortFlag)) return;
 
   const uint4* src = reinterpret_cast<const uint4*>(payload(txSlot));
   uint4* dst = reinterpret_cast<uint4*>(payload(remoteRxSlot));
@@ -117,32 +104,6 @@ __global__ __launch_bounds__(256, 1) void sendKernel(
   const char* srcTail = reinterpret_cast<const char*>(src + vectors);
   char* dstTail = reinterpret_cast<char*>(dst + vectors);
   for (size_t i = threadIdx.x; i < tail; i += blockDim.x) dstTail[i] = srcTail[i];
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    __threadfence_system();
-    st_relaxed_sys_global(&rx->state, SlotReady);
-  }
-}
-
-__global__ void releaseKernel(void* rxSlot, uint32_t* abortFlag) {
-  if (threadIdx.x == 0 && !isAborted(abortFlag)) {
-    __threadfence_system();
-    st_relaxed_sys_global(&control(rxSlot)->state, SlotFree);
-  }
-}
-
-__global__ void signalKernel(uint64_t* address, uint64_t value) {
-  if (threadIdx.x == 0) {
-    __threadfence_system();
-    st_relaxed_sys_global(address, value);
-  }
-}
-
-__global__ void waitKernel(uint64_t* address, uint64_t value, uint32_t* abortFlag) {
-  if (threadIdx.x == 0) {
-    while (ld_volatile_global(address) != value && !isAborted(abortFlag));
-    fence_acq_rel_sys();
-  }
 }
 
 } // namespace
@@ -161,40 +122,18 @@ ncclResult_t ncclLaunchCompressedPrepareRound(
     ncclCompressionTask_t* task, void* rxSlot, void* txSlot, bool prepareSend,
     const void* sendbuff, void* recvbuff, size_t recvcount, size_t blockOffset,
     size_t elementCount, int destination, int typeSize, size_t maxPayloadBytes,
-    uint32_t* abortFlag, cudaStream_t stream) {
+    cudaStream_t stream) {
   prepareRoundKernel<<<1, 1, 0, stream>>>(task, rxSlot, txSlot, prepareSend,
       sendbuff, recvbuff, recvcount, blockOffset, elementCount, destination,
-      typeSize, maxPayloadBytes, abortFlag);
+      typeSize, maxPayloadBytes);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }
 
 ncclResult_t ncclLaunchCompressedSend(
     void* txSlot, void* remoteRxSlot, size_t maxPayloadBytes,
-    uint32_t* abortFlag, cudaStream_t stream) {
-  sendKernel<<<1, 256, 0, stream>>>(txSlot, remoteRxSlot, maxPayloadBytes, abortFlag);
-  CUDACHECK(cudaGetLastError());
-  return ncclSuccess;
-}
-
-ncclResult_t ncclLaunchCompressedRelease(
-    void* rxSlot, uint32_t* abortFlag, cudaStream_t stream) {
-  releaseKernel<<<1, 1, 0, stream>>>(rxSlot, abortFlag);
-  CUDACHECK(cudaGetLastError());
-  return ncclSuccess;
-}
-
-ncclResult_t ncclLaunchCompressedSignal(
-    uint64_t* address, uint64_t value, cudaStream_t stream) {
-  signalKernel<<<1, 1, 0, stream>>>(address, value);
-  CUDACHECK(cudaGetLastError());
-  return ncclSuccess;
-}
-
-ncclResult_t ncclLaunchCompressedWait(
-    uint64_t* address, uint64_t value,
-    uint32_t* abortFlag, cudaStream_t stream) {
-  waitKernel<<<1, 1, 0, stream>>>(address, value, abortFlag);
+    cudaStream_t stream) {
+  sendKernel<<<1, 256, 0, stream>>>(txSlot, remoteRxSlot, maxPayloadBytes);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }

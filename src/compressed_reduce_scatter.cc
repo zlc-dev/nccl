@@ -18,14 +18,36 @@
 #include <cstdlib>
 #include <mutex>
 #include <new>
+#include <thread>
 #include <vector>
+
+struct alignas(64) ncclCompressedRsHostSync {
+  uint64_t recordIssued;
+  uint64_t waitIssued;
+  char padding[64 - 2 * sizeof(uint64_t)];
+};
+static_assert(sizeof(ncclCompressedRsHostSync) == 64, "slot sync must occupy one cache line");
+
+struct ncclCompressedRsHostSyncPage {
+  ncclCompressedRsHostSync slots[NCCL_COMPRESSED_PIPELINE_DEPTH];
+};
 
 struct ncclCompressedRsManager {
   std::mutex mutex;
   cudaMemPool_t localPool = nullptr;
   cudaMemPool_t nextPool = nullptr;
-  ncclCompressedP2pControl* control = nullptr;
-  ncclCompressedP2pControl* remoteControl = nullptr;
+  ncclCompressedRsHostSyncPage* localSync = nullptr;
+  ncclCompressedRsHostSyncPage* nextSync = nullptr;
+  ncclShmHandleInternal* localSyncHandle = nullptr;
+  ncclShmHandleInternal* nextSyncHandle = nullptr;
+  cudaEvent_t localSlotEvents[NCCL_COMPRESSED_PIPELINE_DEPTH] = {};
+  cudaEvent_t nextSlotEvents[NCCL_COMPRESSED_PIPELINE_DEPTH] = {};
+  // localSlotPhase is the last RELEASED/ack phase recorded by this RX owner
+  // (always even). nextSlotPhase is the last READY/cleanup phase recorded by
+  // this rank for the next rank's RX slot (always odd after first use).
+  uint64_t localSlotPhase[NCCL_COMPRESSED_PIPELINE_DEPTH] = {};
+  uint64_t nextSlotPhase[NCCL_COMPRESSED_PIPELINE_DEPTH] = {};
+  cudaStream_t recvStream = nullptr;
   cudaEvent_t tail = nullptr;
   uint64_t sequence = 0;
   bool tailRecorded = false;
@@ -37,6 +59,11 @@ constexpr size_t MinBlockBytes = 512 * 1024;
 constexpr size_t SlotAlignment = 256;
 constexpr size_t PayloadOffset = (sizeof(ncclCompressedP2pSlot) + 15) & ~size_t(15);
 constexpr uint64_t IpcSocketHashSalt = 0x435253504f4f4cULL;
+
+struct ManagerInitInfo {
+  char syncPath[PATH_MAX];
+  cudaIpcEventHandle_t slotEvents[NCCL_COMPRESSED_PIPELINE_DEPTH];
+};
 
 struct Operation {
   ncclComm* comm = nullptr;
@@ -88,6 +115,38 @@ static ncclResult_t wait(cudaStream_t s, cudaEvent_t e) {
   return ncclSuccess;
 }
 
+static ncclResult_t waitHostPhase(ncclComm* comm, uint64_t* address, uint64_t phase) {
+  unsigned spins = 0;
+  while (__atomic_load_n(address, __ATOMIC_ACQUIRE) < phase) {
+    if (comm->abortFlag != nullptr && __atomic_load_n(comm->abortFlag, __ATOMIC_ACQUIRE) != 0)
+      return ncclSystemError;
+    if ((++spins & 0xfff) == 0) std::this_thread::yield();
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t recordIpcPhase(
+    ncclComm* comm, cudaEvent_t event, ncclCompressedRsHostSync* sync,
+    uint64_t phase, cudaStream_t stream) {
+  if (phase == 0) return ncclInternalError;
+  // Re-record is legal only after the peer has submitted the wait which
+  // captured the preceding record.
+  NCCLCHECK(waitHostPhase(comm, &sync->waitIssued, phase - 1));
+  CUDACHECK(cudaEventRecord(event, stream));
+  __atomic_store_n(&sync->recordIssued, phase, __ATOMIC_RELEASE);
+  return ncclSuccess;
+}
+
+static ncclResult_t waitIpcPhase(
+    ncclComm* comm, cudaEvent_t event, ncclCompressedRsHostSync* sync,
+    uint64_t phase, cudaStream_t stream) {
+  // recordIssued means cudaEventRecord has been submitted, not completed.
+  NCCLCHECK(waitHostPhase(comm, &sync->recordIssued, phase));
+  CUDACHECK(cudaStreamWaitEvent(stream, event, 0));
+  __atomic_store_n(&sync->waitIssued, phase, __ATOMIC_RELEASE);
+  return ncclSuccess;
+}
+
 static ncclResult_t validatePlan(const ncclCompressionPlan_t* p) {
   if (p == nullptr || p->size < sizeof(*p) || p->magic != NCCL_COMPRESSION_PLAN_MAGIC ||
       p->blockElements == 0 || p->maxCompressedBytes == nullptr || p->encode == nullptr ||
@@ -117,18 +176,39 @@ static ncclResult_t destroyManagerResources(ncclComm* comm, ncclCompressedRsMana
   CUDACHECKGOTO(cudaGetDevice(&savedDev), ret, done);
   CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), ret, done);
   if (m->tailRecorded) CUDACHECKGOTO(cudaEventSynchronize(m->tail), ret, done);
-  if (m->remoteControl) {
-    CUDACHECKGOTO(cudaFree(m->remoteControl), ret, done);
-    m->remoteControl = nullptr;
+  if (m->recvStream) {
+    CUDACHECKGOTO(cudaStreamDestroy(m->recvStream), ret, done);
+    m->recvStream = nullptr;
   }
+  // Close imported events before the owner is allowed to destroy the
+  // corresponding exported events.
+  for (int s = 0; s < NCCL_COMPRESSED_PIPELINE_DEPTH; s++) {
+    if (m->nextSlotEvents[s]) CUDACHECKIGNORE(cudaEventDestroy(m->nextSlotEvents[s]));
+    m->nextSlotEvents[s] = nullptr;
+  }
+  if (m->nextSyncHandle) (void)ncclOsShmClose(m->nextSyncHandle);
+  m->nextSyncHandle = nullptr;
+  m->nextSync = nullptr;
   if (m->initialized && comm->nRanks > 1) {
     NCCLCHECKGOTO(bootstrapBarrier(comm->bootstrap, comm->rank, comm->nRanks, 0x43525002), ret, done);
   }
 done:
-  if (m->control) CUDACHECKIGNORE(cudaFree(m->control));
+  for (int s = 0; s < NCCL_COMPRESSED_PIPELINE_DEPTH; s++) {
+    if (m->nextSlotEvents[s]) CUDACHECKIGNORE(cudaEventDestroy(m->nextSlotEvents[s]));
+    if (m->localSlotEvents[s]) CUDACHECKIGNORE(cudaEventDestroy(m->localSlotEvents[s]));
+    m->nextSlotEvents[s] = nullptr;
+    m->localSlotEvents[s] = nullptr;
+    m->localSlotPhase[s] = 0;
+    m->nextSlotPhase[s] = 0;
+  }
+  if (m->nextSyncHandle) (void)ncclOsShmClose(m->nextSyncHandle);
+  if (m->localSyncHandle) (void)ncclOsShmClose(m->localSyncHandle);
+  m->nextSyncHandle = nullptr;
+  m->localSyncHandle = nullptr;
+  m->nextSync = nullptr;
+  m->localSync = nullptr;
   if (m->nextPool) CUDACHECKIGNORE(cudaMemPoolDestroy(m->nextPool));
   if (m->localPool) CUDACHECKIGNORE(cudaMemPoolDestroy(m->localPool));
-  m->control = nullptr;
   m->nextPool = nullptr;
   m->localPool = nullptr;
   m->tailRecorded = false;
@@ -145,12 +225,12 @@ static ncclResult_t initializeManager(Operation* op) {
   int next = comm->channels[0].ring.next;
   int prev = comm->channels[0].ring.prev;
   int supported = 0;
+  int ipcEventSupported = 0;
   ncclIpcSocket ipcSocket = {};
   ncclIpcFd exportedFd = NCCL_INVALID_IPC_FD;
   ncclIpcFd importedFd = NCCL_INVALID_IPC_FD;
-  cudaStream_t setupStream = nullptr;
-  cudaMemPoolPtrExportData controlData = {};
-  std::vector<cudaMemPoolPtrExportData> allControlData(comm->nRanks);
+  ManagerInitInfo localInfo = {};
+  std::vector<ManagerInitInfo> allInfo(comm->nRanks);
   uint64_t socketHash = comm->commHash ^ IpcSocketHashSalt;
 
   CUDACHECKGOTO(cudaDeviceGetAttribute(&supported, cudaDevAttrMemoryPoolsSupported, comm->cudaDev), ret, fail);
@@ -163,6 +243,13 @@ static ncclResult_t initializeManager(Operation* op) {
                                        comm->cudaDev), ret, fail);
   if ((supported & cudaMemHandleTypePosixFileDescriptor) == 0) {
     WARN("ncclReduceScatterCompressed: POSIX FD memory-pool IPC is unsupported on device %d", comm->cudaDev);
+    ret = ncclInvalidUsage;
+    goto fail;
+  }
+  CUDACHECKGOTO(cudaDeviceGetAttribute(&ipcEventSupported, cudaDevAttrIpcEventSupport,
+                                       comm->cudaDev), ret, fail);
+  if (!ipcEventSupported) {
+    WARN("ncclReduceScatterCompressed: CUDA IPC events are unsupported on device %d", comm->cudaDev);
     ret = ncclInvalidUsage;
     goto fail;
   }
@@ -182,6 +269,16 @@ static ncclResult_t initializeManager(Operation* op) {
     CUDACHECKGOTO(cudaMemPoolSetAccess(m->localPool, &access, 1), ret, fail);
   }
   CUDACHECKGOTO(cudaEventCreateWithFlags(&m->tail, cudaEventDisableTiming), ret, fail);
+  CUDACHECKGOTO(cudaStreamCreateWithFlags(&m->recvStream, cudaStreamNonBlocking), ret, fail);
+  NCCLCHECKGOTO(ncclOsShmOpen(localInfo.syncPath, sizeof(localInfo.syncPath),
+      sizeof(*m->localSync), reinterpret_cast<void**>(&m->localSync), nullptr,
+      2, &m->localSyncHandle), ret, fail);
+  for (int s = 0; s < NCCL_COMPRESSED_PIPELINE_DEPTH; s++) {
+    CUDACHECKGOTO(cudaEventCreateWithFlags(&m->localSlotEvents[s],
+        cudaEventDisableTiming | cudaEventInterprocess), ret, fail);
+    CUDACHECKGOTO(cudaIpcGetEventHandle(&localInfo.slotEvents[s],
+                                        m->localSlotEvents[s]), ret, fail);
+  }
   NCCLCHECKGOTO(ncclIpcSocketInit(&ipcSocket, comm->rank, socketHash, comm->abortFlag), ret, fail);
   CUDACHECKGOTO(cudaMemPoolExportToShareableHandle(&exportedFd, m->localPool,
                                                    cudaMemHandleTypePosixFileDescriptor, 0), ret, fail);
@@ -206,22 +303,18 @@ static ncclResult_t initializeManager(Operation* op) {
   NCCLCHECKGOTO(ncclIpcFdClose(importedFd) == 0 ? ncclSuccess : ncclSystemError, ret, fail);
   importedFd = NCCL_INVALID_IPC_FD;
 
-  CUDACHECKGOTO(cudaStreamCreateWithFlags(&setupStream, cudaStreamNonBlocking), ret, fail);
-  CUDACHECKGOTO(cudaMallocFromPoolAsync(reinterpret_cast<void**>(&m->control),
-      sizeof(*m->control), m->localPool, setupStream), ret, fail);
-  CUDACHECKGOTO(cudaMemsetAsync(m->control, 0, sizeof(*m->control), setupStream), ret, fail);
-  CUDACHECKGOTO(cudaStreamSynchronize(setupStream), ret, fail);
-  CUDACHECKGOTO(cudaMemPoolExportPointer(&controlData, m->control), ret, fail);
-  allControlData[comm->rank] = controlData;
-  NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allControlData.data(), sizeof(controlData)), ret, fail);
-  CUDACHECKGOTO(cudaMemPoolImportPointer(reinterpret_cast<void**>(&m->remoteControl),
-                                         m->nextPool, &allControlData[next]), ret, fail);
-  CUDACHECKGOTO(cudaStreamDestroy(setupStream), ret, fail);
-  setupStream = nullptr;
+  allInfo[comm->rank] = localInfo;
+  NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allInfo.data(), sizeof(localInfo)), ret, fail);
+  NCCLCHECKGOTO(ncclOsShmOpen(allInfo[next].syncPath, sizeof(allInfo[next].syncPath),
+      sizeof(*m->nextSync), reinterpret_cast<void**>(&m->nextSync), nullptr,
+      0, &m->nextSyncHandle), ret, fail);
+  for (int s = 0; s < NCCL_COMPRESSED_PIPELINE_DEPTH; s++) {
+    CUDACHECKGOTO(cudaIpcOpenEventHandle(&m->nextSlotEvents[s],
+                                         allInfo[next].slotEvents[s]), ret, fail);
+  }
   m->initialized = true;
   trace(op, "connection-ready");
 fail:
-  if (setupStream) CUDACHECKIGNORE(cudaStreamDestroy(setupStream));
   if (ipcSocket.fd != NCCL_INVALID_SOCKET) (void)ncclIpcSocketClose(&ipcSocket);
   if (exportedFd != NCCL_INVALID_IPC_FD) (void)ncclIpcFdClose(exportedFd);
   if (importedFd != NCCL_INVALID_IPC_FD) (void)ncclIpcFdClose(importedFd);
@@ -232,7 +325,10 @@ fail:
 static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize) {
   ncclResult_t ret = ncclSuccess;
   cudaStream_t cs = nullptr;
-  cudaEvent_t ready[2] = {}, done[2] = {};
+  cudaEvent_t setupDone = nullptr;
+  cudaEvent_t ready[NCCL_COMPRESSED_PIPELINE_DEPTH] = {};
+  cudaEvent_t done[NCCL_COMPRESSED_PIPELINE_DEPTH] = {};
+  cudaEvent_t sendDone[NCCL_COMPRESSED_PIPELINE_DEPTH] = {};
   cudaMemPoolPtrExportData rxData = {};
   bool acquired = false;
   ncclComm* comm = j->comm;
@@ -244,9 +340,11 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
   NCCLCHECKGOTO(ncclStrongStreamAcquire(ncclCudaGraphNone(comm->config.graphUsageMode),
       &comm->sharedRes->deviceStream, false, &cs), ret, fail);
   acquired = true;
-  for (int i = 0; i < 2; i++) {
+  CUDACHECKGOTO(cudaEventCreateWithFlags(&setupDone, cudaEventDisableTiming), ret, fail);
+  for (int i = 0; i < NCCL_COMPRESSED_PIPELINE_DEPTH; i++) {
     CUDACHECKGOTO(cudaEventCreateWithFlags(&ready[i], cudaEventDisableTiming), ret, fail);
     CUDACHECKGOTO(cudaEventCreateWithFlags(&done[i], cudaEventDisableTiming), ret, fail);
+    CUDACHECKGOTO(cudaEventCreateWithFlags(&sendDone[i], cudaEventDisableTiming), ret, fail);
   }
   {
     size_t nblocks = 1 + (j->recvcount - 1) / j->plan.blockElements;
@@ -261,15 +359,14 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
     NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allRxData.data(), sizeof(rxData)), ret, fail);
     CUDACHECKGOTO(cudaMemPoolImportPointer(&op->remoteRx, m->nextPool,
                                            &allRxData[next]), ret, fail);
-    NCCLCHECKGOTO(ncclLaunchCompressedSignal(&m->control->allocationReady,
-                                             op->sequence, cs), ret, fail);
-    NCCLCHECKGOTO(ncclLaunchCompressedWait(&m->remoteControl->allocationReady,
-                                           op->sequence, comm->abortFlagDev, cs), ret, fail);
+    NCCLCHECKGOTO(record(setupDone,cs),ret,fail);
+    NCCLCHECKGOTO(wait(m->recvStream,setupDone),ret,fail);
     NCCLCHECKGOTO(record(done[0], j->stream), ret, fail);
     NCCLCHECKGOTO(wait(cs, done[0]), ret, fail);
-    for (size_t w = 0; w < nblocks; w += 2) {
-      int slots = static_cast<int>(std::min<size_t>(2, nblocks - w));
+    for (size_t w = 0; w < nblocks; w += NCCL_COMPRESSED_PIPELINE_DEPTH) {
+      int slots = static_cast<int>(std::min<size_t>(NCCL_COMPRESSED_PIPELINE_DEPTH, nblocks - w));
       for (int s = 0; s < slots; s++) {
+        if (w != 0) NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
         size_t off = (w+s)*j->plan.blockElements;
         size_t count = std::min(j->plan.blockElements, j->recvcount-off);
         int dst = comm->channels[0].ring.userRanks[comm->nRanks-1];
@@ -281,8 +378,16 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
       }
       for (int s=0;s<slots;s++) {
         NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
+        if (m->nextSlotPhase[s] != 0) {
+          NCCLCHECKGOTO(waitIpcPhase(comm, m->nextSlotEvents[s],
+              &m->nextSync->slots[s], m->nextSlotPhase[s] + 1, cs),ret,fail);
+        }
         NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
-          slot(op->remoteRx,op->stride,s),capacity,comm->abortFlagDev,cs),ret,fail);
+          slot(op->remoteRx,op->stride,s),capacity,cs),ret,fail);
+        m->nextSlotPhase[s] += m->nextSlotPhase[s] == 0 ? 1 : 2;
+        NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
+            &m->nextSync->slots[s], m->nextSlotPhase[s], cs),ret,fail);
+        NCCLCHECKGOTO(record(sendDone[s],cs),ret,fail);
       }
       for (int r=0;r<comm->nRanks-1;r++) {
         bool final = r+1 == comm->nRanks-1;
@@ -290,39 +395,58 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
         for (int s=0;s<slots;s++) {
           size_t off=(w+s)*j->plan.blockElements;
           size_t count=std::min(j->plan.blockElements,j->recvcount-off);
+          NCCLCHECKGOTO(wait(m->recvStream,done[s]),ret,fail);
+          NCCLCHECKGOTO(waitIpcPhase(comm, m->localSlotEvents[s],
+              &m->localSync->slots[s], m->localSlotPhase[s] + 1,
+              m->recvStream),ret,fail);
           NCCLCHECKGOTO(ncclLaunchCompressedPrepareRound(op->tasks+s,slot(op->rx,op->stride,s),
             slot(op->tx,op->stride,s),!final,j->sendbuff,final?j->recvbuff:nullptr,j->recvcount,
-            off,count,dst,typeSize,capacity,comm->abortFlagDev,cs),ret,fail);
-          NCCLCHECKGOTO(record(ready[s],cs),ret,fail);
-        }
-        for (int s=0;s<slots;s++) {
+            off,count,dst,typeSize,capacity,m->recvStream),ret,fail);
+          NCCLCHECKGOTO(record(ready[s],m->recvStream),ret,fail);
           NCCLCHECKGOTO(wait(j->stream,ready[s]),ret,fail);
+          if (!final) NCCLCHECKGOTO(wait(j->stream,sendDone[s]),ret,fail);
           if (final) NCCLCHECKGOTO(j->plan.decodeReduceCopy(op->tasks+s,j->datatype,j->op,
               j->plan.context,j->stream),ret,fail);
           else NCCLCHECKGOTO(j->plan.decodeReduceEncode(op->tasks+s,j->datatype,j->op,
               j->plan.context,j->stream),ret,fail);
+          m->localSlotPhase[s] += 2;
+          NCCLCHECKGOTO(recordIpcPhase(comm, m->localSlotEvents[s],
+              &m->localSync->slots[s], m->localSlotPhase[s],
+              j->stream),ret,fail);
           NCCLCHECKGOTO(record(done[s],j->stream),ret,fail);
-        }
-        for (int s=0;s<slots;s++) {
-          NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
-          NCCLCHECKGOTO(ncclLaunchCompressedRelease(slot(op->rx,op->stride,s),comm->abortFlagDev,cs),ret,fail);
-          if (!final) NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
-            slot(op->remoteRx,op->stride,s),capacity,comm->abortFlagDev,cs),ret,fail);
+          if (!final) {
+            NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
+            NCCLCHECKGOTO(waitIpcPhase(comm, m->nextSlotEvents[s],
+                &m->nextSync->slots[s], m->nextSlotPhase[s] + 1, cs),ret,fail);
+            NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
+              slot(op->remoteRx,op->stride,s),capacity,cs),ret,fail);
+            m->nextSlotPhase[s] += 2;
+            NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
+                &m->nextSync->slots[s], m->nextSlotPhase[s], cs),ret,fail);
+            NCCLCHECKGOTO(record(sendDone[s],cs),ret,fail);
+          }
         }
       }
     }
+    for (int s=0;s<std::min<size_t>(NCCL_COMPRESSED_PIPELINE_DEPTH,nblocks);s++)
+      NCCLCHECKGOTO(waitIpcPhase(comm, m->nextSlotEvents[s],
+          &m->nextSync->slots[s], m->nextSlotPhase[s] + 1, cs),ret,fail);
     CUDACHECKGOTO(cudaFreeAsync(op->remoteRx, cs), ret, fail);
     op->remoteRx = nullptr;
-    NCCLCHECKGOTO(ncclLaunchCompressedSignal(&m->remoteControl->importFreed,
-                                             op->sequence, cs), ret, fail);
-    NCCLCHECKGOTO(ncclLaunchCompressedWait(&m->control->importFreed,
-                                           op->sequence, comm->abortFlagDev, cs), ret, fail);
+    m->nextSlotPhase[0] += 2;
+    NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[0],
+        &m->nextSync->slots[0], m->nextSlotPhase[0], cs),ret,fail);
+    NCCLCHECKGOTO(waitIpcPhase(comm, m->localSlotEvents[0],
+        &m->localSync->slots[0], m->localSlotPhase[0] + 1, cs),ret,fail);
     CUDACHECKGOTO(cudaFreeAsync(op->rx, cs), ret, fail);
     CUDACHECKGOTO(cudaFreeAsync(op->tx, cs), ret, fail);
     CUDACHECKGOTO(cudaFreeAsync(op->tasks, cs), ret, fail);
     op->rx = nullptr;
     op->tx = nullptr;
     op->tasks = nullptr;
+    m->localSlotPhase[0] += 2;
+    NCCLCHECKGOTO(recordIpcPhase(comm, m->localSlotEvents[0],
+        &m->localSync->slots[0], m->localSlotPhase[0], cs),ret,fail);
     NCCLCHECKGOTO(record(ready[0],cs),ret,fail);
     NCCLCHECKGOTO(wait(j->stream,ready[0]),ret,fail);
     NCCLCHECKGOTO(record(m->tail,j->stream),ret,fail);
@@ -334,9 +458,11 @@ fail:
       &comm->sharedRes->deviceStream,false);
     if (ret==ncclSuccess) ret=x;
   }
-  for(int i=0;i<2;i++) {
+  if(setupDone) CUDACHECKIGNORE(cudaEventDestroy(setupDone));
+  for(int i=0;i<NCCL_COMPRESSED_PIPELINE_DEPTH;i++) {
     if(ready[i]) CUDACHECKIGNORE(cudaEventDestroy(ready[i]));
     if(done[i]) CUDACHECKIGNORE(cudaEventDestroy(done[i]));
+    if(sendDone[i]) CUDACHECKIGNORE(cudaEventDestroy(sendDone[i]));
   }
   trace(op, ret == ncclSuccess ? "enqueue-end" : "enqueue-error");
   return ret;
