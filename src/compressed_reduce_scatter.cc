@@ -87,6 +87,12 @@ struct Job {
   cudaStream_t stream;
 };
 
+struct SlotState {
+  size_t block = 0;
+  int round = 0;
+  bool active = false;
+};
+
 static size_t alignUp(size_t n, size_t a) { return (n + a - 1) / a * a; }
 static char* slot(void* arena, size_t stride, int i) {
   return static_cast<char*>(arena) + stride * static_cast<size_t>(i);
@@ -381,39 +387,36 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
     }
     NCCLCHECKGOTO(record(done[0], j->stream), ret, fail);
     NCCLCHECKGOTO(wait(cs, done[0]), ret, fail);
-    for (size_t w = 0; w < nblocks; w += NCCL_COMPRESSED_PIPELINE_DEPTH) {
-      int slots = static_cast<int>(std::min<size_t>(NCCL_COMPRESSED_PIPELINE_DEPTH, nblocks - w));
-      for (int s = 0; s < slots; s++) {
-        if (w != 0) NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
-        size_t off = (w+s)*j->plan.blockElements;
-        size_t count = std::min(j->plan.blockElements, j->recvcount-off);
-        int dst = comm->channels[0].ring.userRanks[comm->nRanks-1];
-        NCCLCHECKGOTO(ncclLaunchCompressedPrepareEncode(op->tasks+s, slot(op->tx,op->stride,s),
-          j->sendbuff,j->recvcount,off,count,dst,typeSize,capacity,cs), ret, fail);
-        NCCLCHECKGOTO(record(ready[s],cs),ret,fail); NCCLCHECKGOTO(wait(j->stream,ready[s]),ret,fail);
-        NCCLCHECKGOTO(j->plan.encode(op->tasks+s,j->datatype,j->plan.context,j->stream),ret,fail);
-        NCCLCHECKGOTO(record(done[s],j->stream),ret,fail);
-      }
-      for (int s=0;s<slots;s++) {
-        NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
-        // The first wave already waited for allocation-ready. Later waves
-        // reuse the same remote RX slots and must wait for the preceding
-        // wave's final RELEASED phase before overwriting them.
-        if (w != 0) {
-          NCCLCHECKGOTO(waitIpcPhase(comm, m->nextSlotEvents[s],
-              &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs), ret, fail);
-        }
-        NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
-          slot(op->remoteRx,op->stride,s),capacity,cs),ret,fail);
-        NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
-            &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
-        NCCLCHECKGOTO(record(sendDone[s],cs),ret,fail);
-      }
-      for (int r=0;r<comm->nRanks-1;r++) {
-        bool final = r+1 == comm->nRanks-1;
-        int dst = comm->channels[0].ring.userRanks[comm->nRanks-2-r];
-        for (int s=0;s<slots;s++) {
-          size_t off=(w+s)*j->plan.blockElements;
+    SlotState states[NCCL_COMPRESSED_PIPELINE_DEPTH] = {};
+    size_t nextBlock = static_cast<size_t>(activeSlots);
+    int active = activeSlots;
+    for (int s = 0; s < activeSlots; s++) {
+      states[s].block = static_cast<size_t>(s);
+      states[s].active = true;
+      size_t off = states[s].block*j->plan.blockElements;
+      size_t count = std::min(j->plan.blockElements, j->recvcount-off);
+      int dst = comm->channels[0].ring.userRanks[comm->nRanks-1];
+      NCCLCHECKGOTO(ncclLaunchCompressedPrepareEncode(op->tasks+s, slot(op->tx,op->stride,s),
+        j->sendbuff,j->recvcount,off,count,dst,typeSize,capacity,cs), ret, fail);
+      NCCLCHECKGOTO(record(ready[s],cs),ret,fail); NCCLCHECKGOTO(wait(j->stream,ready[s]),ret,fail);
+      NCCLCHECKGOTO(j->plan.encode(op->tasks+s,j->datatype,j->plan.context,j->stream),ret,fail);
+      NCCLCHECKGOTO(record(done[s],j->stream),ret,fail);
+    }
+    for (int s=0;s<activeSlots;s++) {
+      NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
+      NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
+        slot(op->remoteRx,op->stride,s),capacity,cs),ret,fail);
+      NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
+          &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
+      NCCLCHECKGOTO(record(sendDone[s],cs),ret,fail);
+    }
+    while (active != 0) {
+      for (int s=0;s<activeSlots;s++) {
+          if (!states[s].active) continue;
+          int r = states[s].round;
+          bool final = r+1 == comm->nRanks-1;
+          int dst = comm->channels[0].ring.userRanks[comm->nRanks-2-r];
+          size_t off=states[s].block*j->plan.blockElements;
           size_t count=std::min(j->plan.blockElements,j->recvcount-off);
           NCCLCHECKGOTO(wait(m->recvStream,done[s]),ret,fail);
           NCCLCHECKGOTO(waitIpcPhase(comm, m->localSlotEvents[s],
@@ -445,8 +448,36 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
             NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
                 &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
             NCCLCHECKGOTO(record(sendDone[s],cs),ret,fail);
+            states[s].round++;
+          } else if (nextBlock < nblocks) {
+            // This physical slot is now free. Refill and send it immediately
+            // instead of draining the other slot and ending a two-block wave.
+            states[s].block = nextBlock++;
+            states[s].round = 0;
+            off = states[s].block*j->plan.blockElements;
+            count = std::min(j->plan.blockElements, j->recvcount-off);
+            dst = comm->channels[0].ring.userRanks[comm->nRanks-1];
+            NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
+            NCCLCHECKGOTO(ncclLaunchCompressedPrepareEncode(op->tasks+s,
+              slot(op->tx,op->stride,s),j->sendbuff,j->recvcount,off,count,dst,
+              typeSize,capacity,cs),ret,fail);
+            NCCLCHECKGOTO(record(ready[s],cs),ret,fail);
+            NCCLCHECKGOTO(wait(j->stream,ready[s]),ret,fail);
+            NCCLCHECKGOTO(j->plan.encode(op->tasks+s,j->datatype,
+              j->plan.context,j->stream),ret,fail);
+            NCCLCHECKGOTO(record(done[s],j->stream),ret,fail);
+            NCCLCHECKGOTO(wait(cs,done[s]),ret,fail);
+            NCCLCHECKGOTO(waitIpcPhase(comm, m->nextSlotEvents[s],
+              &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
+            NCCLCHECKGOTO(ncclLaunchCompressedSend(slot(op->tx,op->stride,s),
+              slot(op->remoteRx,op->stride,s),capacity,cs),ret,fail);
+            NCCLCHECKGOTO(recordIpcPhase(comm, m->nextSlotEvents[s],
+              &m->nextSync->slots[s], ++m->nextSlotPhase[s], cs),ret,fail);
+            NCCLCHECKGOTO(record(sendDone[s],cs),ret,fail);
+          } else {
+            states[s].active = false;
+            active--;
           }
-        }
       }
     }
     for (int s=0;s<activeSlots;s++)
