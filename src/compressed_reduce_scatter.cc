@@ -419,12 +419,15 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           NCCLCHECKGOTO(waitIpcPhase(comm, m->localSlotEvents[s],
               &m->localSync->slots[s], ++m->localSlotPhase[s],
               m->recvStream),ret,fail);
+          // prepareRound resets the TX frame header for non-final rounds.
+          // Protect the entire TX slot, not only the codec payload write,
+          // from racing the preceding send kernel.
+          if (!final) NCCLCHECKGOTO(wait(m->recvStream,sendDone[s]),ret,fail);
           NCCLCHECKGOTO(ncclLaunchCompressedPrepareRound(op->tasks+s,slot(op->rx,op->stride,s),
             slot(op->tx,op->stride,s),!final,j->sendbuff,final?j->recvbuff:nullptr,j->recvcount,
             off,count,dst,typeSize,capacity,m->recvStream),ret,fail);
           NCCLCHECKGOTO(record(ready[s],m->recvStream),ret,fail);
           NCCLCHECKGOTO(wait(j->stream,ready[s]),ret,fail);
-          if (!final) NCCLCHECKGOTO(wait(j->stream,sendDone[s]),ret,fail);
           if (final) NCCLCHECKGOTO(j->plan.decodeReduceCopy(op->tasks+s,j->datatype,j->op,
               j->plan.context,j->stream),ret,fail);
           else NCCLCHECKGOTO(j->plan.decodeReduceEncode(op->tasks+s,j->datatype,j->op,
