@@ -919,10 +919,17 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
               state.token--;
             } else if (state.nextBatchCount > 0) {
               state.batchCount = state.nextBatchCount;
-              for (int nextToken = 0; nextToken < state.batchCount; nextToken++) {
-                state.blocks[nextToken] = state.nextBlocks[nextToken];
-                state.baseLanes[nextToken] = state.nextBaseLanes[nextToken];
-                state.initialPending[nextToken] =
+              // Tokens are consumed from batchCount-1 down to zero. Reverse
+              // the rolling cohort so that consumption follows the order in
+              // which final-copy released its lanes. That order forms the
+              // credit chain: each task writes the lane released for the next
+              // task. Consuming it backwards can make every rank wait on a
+              // lane that is only released by a later task.
+              for (int token = 0; token < state.batchCount; token++) {
+                int nextToken = state.batchCount - 1 - token;
+                state.blocks[token] = state.nextBlocks[nextToken];
+                state.baseLanes[token] = state.nextBaseLanes[nextToken];
+                state.initialPending[token] =
                     state.nextInitialPending[nextToken];
                 state.nextInitialPending[nextToken] = false;
               }
