@@ -81,6 +81,7 @@ namespace {
 constexpr size_t MinBlockBytes = 512 * 1024;
 constexpr size_t TargetSliceBytes = 256 * 1024;
 constexpr int MaxSliceCtas = 4;
+constexpr int DefaultActiveRings = 2;
 constexpr size_t SlotAlignment = 256;
 constexpr size_t PayloadOffset = (sizeof(ncclCompressedP2pSlot) + 15) & ~size_t(15);
 constexpr uint64_t IpcSocketHashSalt = 0x435253504f4f4cULL;
@@ -168,6 +169,18 @@ static ncclResult_t record(cudaEvent_t e, cudaStream_t s) {
 static bool traceEnabled() {
   static bool enabled = std::getenv("NCCL_COMPRESSED_RS_TRACE") != nullptr;
   return enabled;
+}
+
+static int activeRingLimit() {
+  static int limit = []() {
+    const char* value = std::getenv("NCCL_COMPRESSED_RS_RINGS");
+    if (value == nullptr || *value == '\0') return DefaultActiveRings;
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (*end != '\0' || parsed < 1) return DefaultActiveRings;
+    return static_cast<int>(std::min<long>(parsed, MAXCHANNELS));
+  }();
+  return limit;
 }
 
 static void trace(const Operation* op, const char* phase) {
@@ -532,7 +545,8 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
   size_t rxArenaBytes = op->stride * NCCL_COMPRESSED_RX_DEPTH;
   size_t txArenaBytes = op->stride * NCCL_COMPRESSED_TX_DEPTH;
   size_t nblocks = 1 + (j->recvcount - 1) / j->plan.blockElements;
-  int activeRings = std::min<size_t>(m->ringCount, nblocks);
+  int activeRings = static_cast<int>(std::min<size_t>(nblocks,
+      static_cast<size_t>(std::min(m->ringCount, activeRingLimit()))));
   std::vector<cudaMemPoolPtrExportData> allRxData(
       static_cast<size_t>(comm->nRanks) * activeRings);
   std::vector<int> destinations(nblocks);
