@@ -145,8 +145,10 @@ struct RingLaunchState {
   int token = -1;
   uint32_t round = 0;
   size_t nextBlockOrdinal = 0;
+  size_t initialSendsSubmitted = 0;
   size_t completedBlocks = 0;
   size_t blockCount = 0;
+  bool cohortComplete = false;
 };
 
 static size_t alignUp(size_t n, size_t a) { return (n + a - 1) / a * a; }
@@ -803,7 +805,8 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
       bool progressed = false;
       for (int c = 0; c < activeRings; c++) {
         RingLaunchState& state = ringState[c];
-        if (state.completedBlocks != state.blockCount)
+        if (state.completedBlocks != state.blockCount ||
+            state.initialSendsSubmitted != state.blockCount)
           done = false;
       }
       if (done) break;
@@ -864,6 +867,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
                 &ring.nextDataReadyPhase[lane], ring.sendStream, &submitted), ret, fail);
             if (!submitted) { ret = ncclInternalError; goto fail; }
             initialPending[token] = false;
+            state.initialSendsSubmitted++;
             // With two ranks the initial send is immediately followed by the
             // final reduction. Once this send is submitted, the lane's next
             // credit can only be produced by that final-copy, so the next
@@ -881,6 +885,44 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
             progressed = true;
           }
         }
+      }
+
+      // Receiving and reducing a cohort does not imply that this rank has
+      // submitted every initial send belonging to it. Early-send makes those
+      // two progress paths independent. Keep the physical cohort intact until
+      // all of its initial sends have entered the send stream; otherwise a
+      // later cohort can reuse the token/lane mapping while an older send is
+      // still pending and different ranks can associate the same lane phase
+      // with different blocks.
+      for (int c = 0; c < activeRings; c++) {
+        RingLaunchState& state = ringState[c];
+        if (!state.cohortComplete) continue;
+        bool sendsSubmitted = true;
+        for (int token = 0; token < state.batchCount; token++)
+          sendsSubmitted = sendsSubmitted && !state.initialPending[token];
+        if (!sendsSubmitted) continue;
+        if (state.completedBlocks == state.blockCount) {
+          state.cohortComplete = false;
+          continue;
+        }
+        if (state.nextBatchCount == 0) continue;
+        state.batchCount = state.nextBatchCount;
+        // Tokens are consumed from batchCount-1 down to zero. Reverse the
+        // rolling cohort so consumption follows the order in which the prior
+        // cohort released its lanes.
+        for (int token = 0; token < state.batchCount; token++) {
+          int nextToken = state.batchCount - 1 - token;
+          state.blocks[token] = state.nextBlocks[nextToken];
+          state.baseLanes[token] = state.nextBaseLanes[nextToken];
+          state.initialPending[token] =
+              state.nextInitialPending[nextToken];
+          state.nextInitialPending[nextToken] = false;
+        }
+        state.nextBatchCount = 0;
+        state.round = 0;
+        state.token = state.batchCount - 1;
+        state.cohortComplete = false;
+        progressed = true;
       }
 
       // A single compute stream scans all ready RX lanes. For intermediate
@@ -984,27 +1026,9 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
             state.completedBlocks++;
             if (state.token > 0) {
               state.token--;
-            } else if (state.nextBatchCount > 0) {
-              state.batchCount = state.nextBatchCount;
-              // Tokens are consumed from batchCount-1 down to zero. Reverse
-              // the rolling cohort so that consumption follows the order in
-              // which final-copy released its lanes. That order forms the
-              // credit chain: each task writes the lane released for the next
-              // task. Consuming it backwards can make every rank wait on a
-              // lane that is only released by a later task.
-              for (int token = 0; token < state.batchCount; token++) {
-                int nextToken = state.batchCount - 1 - token;
-                state.blocks[token] = state.nextBlocks[nextToken];
-                state.baseLanes[token] = state.nextBaseLanes[nextToken];
-                state.initialPending[token] =
-                    state.nextInitialPending[nextToken];
-                state.nextInitialPending[nextToken] = false;
-              }
-              state.nextBatchCount = 0;
-              state.round = 0;
-              state.token = state.batchCount - 1;
             } else {
               state.token = -1;
+              state.cohortComplete = true;
             }
           }
           progressed = true;
