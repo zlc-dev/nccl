@@ -23,13 +23,6 @@ ncclResult_t ncclLaunchCompressedPrepareEncodeAll(
     size_t blockCount, const int* destinations, int typeSize,
     size_t maxPayloadBytes, cudaStream_t stream);
 
-ncclResult_t ncclLaunchCompressedPrepareRound(
-    ncclCompressionTask_t* task, void* rxSlot, void* txSlot,
-    bool prepareSend, const void* sendbuff, void* recvbuff,
-    size_t recvcount, size_t blockOffset, size_t elementCount,
-    int destination, int typeSize,
-    size_t maxPayloadBytes, cudaStream_t stream);
-
 ncclResult_t ncclLaunchCompressedSend(
     void* txSlot, void* remoteRxSlot, size_t slotStride,
     size_t maxPayloadBytes, int segmentCount, int ctaCount,

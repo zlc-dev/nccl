@@ -511,9 +511,10 @@ typedef struct ncclCompressedFrameHeader {
 #define NCCL_COMPRESSED_FRAME_FLAG_SIZE_ERROR 0x1u
 
 /*
- * Device-resident task populated by NCCL before invoking a compression callback.
  * Each task describes exactly one contiguous block. The encode callback receives
- * an array of tasks; reduction callbacks receive one task.
+ * a device-resident array of tasks. Reduction task descriptors are passed by
+ * value on the Host; every pointer stored in the descriptor addresses device
+ * memory and may be consumed by a kernel launched on the supplied stream.
  */
 typedef struct ncclCompressionTask {
   const void* compressedInput;
@@ -540,11 +541,11 @@ typedef ncclResult_t (*ncclCompressionEncodeFn)(
     ncclDataType_t datatype, void* context, cudaStream_t stream);
 
 typedef ncclResult_t (*ncclCompressionDecodeReduceEncodeFn)(
-    const ncclCompressionTask_t* task,
+    ncclCompressionTask_t task,
     ncclDataType_t datatype, ncclRedOp_t op, void* context, cudaStream_t stream);
 
 typedef ncclResult_t (*ncclCompressionDecodeReduceCopyFn)(
-    const ncclCompressionTask_t* task,
+    ncclCompressionTask_t task,
     ncclDataType_t datatype, ncclRedOp_t op, void* context, cudaStream_t stream);
 
 typedef struct ncclCompressionPlan {

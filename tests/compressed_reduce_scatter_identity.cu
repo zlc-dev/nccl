@@ -108,48 +108,50 @@ __global__ void encodeIdentity(const ncclCompressionTask_t* tasks,
   }
 }
 
-__global__ void decodeReduceEncodeIdentity(const ncclCompressionTask_t* task) {
+__global__ void decodeReduceEncodeIdentity(ncclCompressionTask_t task) {
   extern __shared__ float tile[];
   volatile float* compressedTile = tile;
   volatile float* localTile = tile + blockDim.x;
-  const float* input = static_cast<const float*>(task->compressedInput);
-  const float* local = static_cast<const float*>(task->localInput);
-  float* output = static_cast<float*>(task->compressedOutput);
-  for (size_t base = blockIdx.x * blockDim.x; base < task->elementCount;
+  const float* input = static_cast<const float*>(task.compressedInput);
+  const float* local = static_cast<const float*>(task.localInput);
+  float* output = static_cast<float*>(task.compressedOutput);
+  for (size_t base = blockIdx.x * blockDim.x; base < task.elementCount;
        base += static_cast<size_t>(gridDim.x) * blockDim.x) {
     size_t i = base + threadIdx.x;
-    if (i < task->elementCount) {
+    if (i < task.elementCount) {
       compressedTile[threadIdx.x] = input[i];
       localTile[threadIdx.x] = local[i];
     }
     __syncthreads();
-    if (i < task->elementCount) output[i] = compressedTile[threadIdx.x] + localTile[threadIdx.x];
+    if (i < task.elementCount) output[i] = compressedTile[threadIdx.x] + localTile[threadIdx.x];
     __syncthreads();
   }
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    uint32_t expected = static_cast<uint32_t>(task->elementCount * sizeof(float));
-    task->outputHeader->payloadBytes = expected;
-    task->outputHeader->flags = task->inputHeader->flags |
-        (task->inputHeader->payloadBytes == expected ? 0u : NCCL_COMPRESSED_FRAME_FLAG_SIZE_ERROR);
+    uint32_t expected = static_cast<uint32_t>(task.elementCount * sizeof(float));
+    task.outputHeader->payloadBytes = expected;
+    task.outputHeader->flags = task.inputHeader->flags |
+        (task.inputHeader->payloadBytes == expected ? 0u : NCCL_COMPRESSED_FRAME_FLAG_SIZE_ERROR);
+    task.outputHeader->reserved0 = 0;
+    task.outputHeader->reserved1 = 0;
   }
 }
 
-__global__ void decodeReduceCopyIdentity(const ncclCompressionTask_t* task) {
+__global__ void decodeReduceCopyIdentity(ncclCompressionTask_t task) {
   extern __shared__ float tile[];
   volatile float* compressedTile = tile;
   volatile float* localTile = tile + blockDim.x;
-  const float* input = static_cast<const float*>(task->compressedInput);
-  const float* local = static_cast<const float*>(task->localInput);
-  float* output = static_cast<float*>(task->output);
-  for (size_t base = blockIdx.x * blockDim.x; base < task->elementCount;
+  const float* input = static_cast<const float*>(task.compressedInput);
+  const float* local = static_cast<const float*>(task.localInput);
+  float* output = static_cast<float*>(task.output);
+  for (size_t base = blockIdx.x * blockDim.x; base < task.elementCount;
        base += static_cast<size_t>(gridDim.x) * blockDim.x) {
     size_t i = base + threadIdx.x;
-    if (i < task->elementCount) {
+    if (i < task.elementCount) {
       compressedTile[threadIdx.x] = input[i];
       localTile[threadIdx.x] = local[i];
     }
     __syncthreads();
-    if (i < task->elementCount) output[i] = compressedTile[threadIdx.x] + localTile[threadIdx.x];
+    if (i < task.elementCount) output[i] = compressedTile[threadIdx.x] + localTile[threadIdx.x];
     __syncthreads();
   }
 }
@@ -182,7 +184,7 @@ ncclResult_t launchEncode(const ncclCompressionTask_t* tasks, size_t taskCount,
   return cudaGetLastError() == cudaSuccess ? ncclSuccess : ncclUnhandledCudaError;
 }
 
-ncclResult_t launchDecodeReduceEncode(const ncclCompressionTask_t* task,
+ncclResult_t launchDecodeReduceEncode(ncclCompressionTask_t task,
                                       ncclDataType_t datatype, ncclRedOp_t op,
                                       void* context, cudaStream_t stream) {
   if (datatype != ncclFloat || op != ncclSum || context == nullptr) return ncclInvalidArgument;
@@ -191,7 +193,7 @@ ncclResult_t launchDecodeReduceEncode(const ncclCompressionTask_t* task,
   return cudaGetLastError() == cudaSuccess ? ncclSuccess : ncclUnhandledCudaError;
 }
 
-ncclResult_t launchDecodeReduceCopy(const ncclCompressionTask_t* task,
+ncclResult_t launchDecodeReduceCopy(ncclCompressionTask_t task,
                                     ncclDataType_t datatype, ncclRedOp_t op,
                                     void* context, cudaStream_t stream) {
   if (datatype != ncclFloat || op != ncclSum || context == nullptr) return ncclInvalidArgument;

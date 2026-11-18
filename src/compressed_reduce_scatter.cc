@@ -97,7 +97,6 @@ struct OperationRing {
   void* tx = nullptr;
   void* rx = nullptr;
   void* remoteRx = nullptr;
-  ncclCompressionTask_t* tasks = nullptr;
 };
 
 struct Operation {
@@ -145,7 +144,6 @@ struct OutboundItem {
 };
 
 struct RingLaunchState {
-  cudaEvent_t rxPrepared[NCCL_COMPRESSED_RX_DEPTH] = {};
   cudaEvent_t finish = nullptr;
   RxLaneState rx[NCCL_COMPRESSED_RX_DEPTH] = {};
   TxSlotState tx[NCCL_COMPRESSED_TX_DEPTH] = {};
@@ -160,6 +158,12 @@ struct RingLaunchState {
 static size_t alignUp(size_t n, size_t a) { return (n + a - 1) / a * a; }
 static char* slot(void* arena, size_t stride, int i) {
   return static_cast<char*>(arena) + stride * static_cast<size_t>(i);
+}
+static char* payload(void* frame) {
+  return static_cast<char*>(frame) + PayloadOffset;
+}
+static ncclCompressedFrameHeader_t* header(void* frame) {
+  return &static_cast<ncclCompressedP2pSlot*>(frame)->frame;
 }
 static ncclResult_t record(cudaEvent_t e, cudaStream_t s) {
   CUDACHECK(cudaEventRecord(e, s));
@@ -566,9 +570,6 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
   CUDACHECKGOTO(cudaEventCreateWithFlags(&cleanupDone, cudaEventDisableTiming), ret, fail);
   for (int c = 0; c < activeRings; c++) {
     CUDACHECKGOTO(cudaEventCreateWithFlags(&ringState[c].finish, cudaEventDisableTiming), ret, fail);
-    for (int s = 0; s < NCCL_COMPRESSED_RX_DEPTH; s++)
-      CUDACHECKGOTO(cudaEventCreateWithFlags(&ringState[c].rxPrepared[s],
-          cudaEventDisableTiming), ret, fail);
     for (int s = 0; s < NCCL_COMPRESSED_TX_DEPTH; s++) {
       CUDACHECKGOTO(cudaEventCreateWithFlags(&ringState[c].tx[s].computeDone,
           cudaEventDisableTiming), ret, fail);
@@ -589,8 +590,6 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
       OperationRing& ringOp = op->rings[c];
       CUDACHECKGOTO(cudaMallocFromPoolAsync(&ringOp.tx, txArenaBytes, m->localPool, cs), ret, fail);
       CUDACHECKGOTO(cudaMallocFromPoolAsync(&ringOp.rx, rxArenaBytes, m->localPool, cs), ret, fail);
-      CUDACHECKGOTO(cudaMallocFromPoolAsync(reinterpret_cast<void**>(&ringOp.tasks),
-          sizeof(*ringOp.tasks) * NCCL_COMPRESSED_RX_DEPTH, m->localPool, cs), ret, fail);
       CUDACHECKGOTO(cudaMemsetAsync(ringOp.rx, 0, rxArenaBytes, cs), ret, fail);
       CUDACHECKGOTO(cudaMemPoolExportPointer(
           &allRxData[static_cast<size_t>(comm->rank) * activeRings + c], ringOp.rx), ret, fail);
@@ -743,27 +742,32 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           }
           bool submitted = false;
           NCCLCHECKGOTO(tryWaitIpcPhase(ring.localDataReady[lane], ready,
-              &ring.localDataReadyPhase[lane], ring.recvStream, &submitted), ret, fail);
+              &ring.localDataReadyPhase[lane], j->stream, &submitted), ret, fail);
           if (!submitted) { ret = ncclInternalError; goto fail; }
           if (tx >= 0 && state.tx[tx].reuseWait) {
-            NCCLCHECKGOTO(wait(ring.recvStream, state.tx[tx].sendDone), ret, fail);
+            NCCLCHECKGOTO(wait(j->stream, state.tx[tx].sendDone), ret, fail);
             state.tx[tx].reuseWait = false;
           }
           int dst = comm->channels[c].ring.userRanks[comm->nRanks - 2 - rx.round];
           size_t off = rx.block * j->plan.blockElements;
           size_t count = std::min(j->plan.blockElements, j->recvcount - off);
-          NCCLCHECKGOTO(ncclLaunchCompressedPrepareRound(ringOp.tasks + lane,
-              slot(ringOp.rx, op->stride, lane),
-              tx >= 0 ? slot(ringOp.tx, op->stride, tx) : ringOp.tx,
-              !final, j->sendbuff, final ? j->recvbuff : nullptr, j->recvcount,
-              off, count, dst, typeSize, capacity, ring.recvStream), ret, fail);
-          NCCLCHECKGOTO(record(state.rxPrepared[lane], ring.recvStream), ret, fail);
-          NCCLCHECKGOTO(wait(j->stream, state.rxPrepared[lane]), ret, fail);
+          void* rxSlot = slot(ringOp.rx, op->stride, lane);
+          void* txSlot = tx >= 0 ? slot(ringOp.tx, op->stride, tx) : nullptr;
+          size_t inputElement = static_cast<size_t>(dst) * j->recvcount + off;
+          ncclCompressionTask_t task = {};
+          task.compressedInput = payload(rxSlot);
+          task.inputHeader = header(rxSlot);
+          task.compressedOutput = txSlot == nullptr ? nullptr : payload(txSlot);
+          task.outputHeader = txSlot == nullptr ? nullptr : header(txSlot);
+          task.localInput = static_cast<const char*>(j->sendbuff) + inputElement * typeSize;
+          task.output = final ? static_cast<char*>(j->recvbuff) + off * typeSize : nullptr;
+          task.elementCount = count;
+          task.compressedCapacity = capacity;
           if (final)
-            NCCLCHECKGOTO(j->plan.decodeReduceCopy(ringOp.tasks + lane,
+            NCCLCHECKGOTO(j->plan.decodeReduceCopy(task,
                 j->datatype, j->op, j->plan.context, j->stream), ret, fail);
           else
-            NCCLCHECKGOTO(j->plan.decodeReduceEncode(ringOp.tasks + lane,
+            NCCLCHECKGOTO(j->plan.decodeReduceEncode(task,
                 j->datatype, j->op, j->plan.context, j->stream), ret, fail);
           NCCLCHECKGOTO(tryRecordIpcPhase(ring.localCanWrite[lane], credit,
               &ring.localCanWritePhase[lane], j->stream, &submitted), ret, fail);
@@ -863,10 +867,8 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
       NCCLCHECKGOTO(wait(cs, ringState[c].finish), ret, fail);
       CUDACHECKGOTO(cudaFreeAsync(op->rings[c].rx, cs), ret, fail);
       CUDACHECKGOTO(cudaFreeAsync(op->rings[c].tx, cs), ret, fail);
-      CUDACHECKGOTO(cudaFreeAsync(op->rings[c].tasks, cs), ret, fail);
       op->rings[c].rx = nullptr;
       op->rings[c].tx = nullptr;
-      op->rings[c].tasks = nullptr;
     }
     CUDACHECKGOTO(cudaFreeAsync(op->preencoded, cs), ret, fail);
     CUDACHECKGOTO(cudaFreeAsync(op->preencodeTasks, cs), ret, fail);
@@ -891,9 +893,6 @@ fail:
   if (cleanupDone) CUDACHECKIGNORE(cudaEventDestroy(cleanupDone));
   for (int c = 0; c < activeRings; c++) {
     if (ringState[c].finish) CUDACHECKIGNORE(cudaEventDestroy(ringState[c].finish));
-    for (int s = 0; s < NCCL_COMPRESSED_RX_DEPTH; s++)
-      if (ringState[c].rxPrepared[s])
-        CUDACHECKIGNORE(cudaEventDestroy(ringState[c].rxPrepared[s]));
     for (int s = 0; s < NCCL_COMPRESSED_TX_DEPTH; s++) {
       if (ringState[c].tx[s].computeDone)
         CUDACHECKIGNORE(cudaEventDestroy(ringState[c].tx[s].computeDone));
