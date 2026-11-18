@@ -82,24 +82,33 @@ __device__ __forceinline__ void sendSegment(
 
   constexpr size_t PackBytes = 16;
   constexpr size_t Unroll = 8;
+  constexpr size_t WarpBytes = WARP_SIZE * PackBytes;
+  constexpr size_t HunkBytes = Unroll * WarpBytes;
   uintptr_t src = cvta_to_global(payload(txSlot));
   uintptr_t dst = cvta_to_global(payload(remoteRxSlot));
   size_t packs = static_cast<size_t>(bytes) / PackBytes;
   size_t packBegin = packs * segmentSlice / segmentSlices;
   size_t packEnd = packs * (segmentSlice + 1) / segmentSlices;
-  size_t i = packBegin + threadIdx.x;
-  for (; i + (Unroll - 1) * blockDim.x < packEnd;
-       i += Unroll * blockDim.x) {
+  size_t sliceBytes = (packEnd - packBegin) * PackBytes;
+  size_t fullHunks = sliceBytes / HunkBytes;
+  int warp = threadIdx.x / WARP_SIZE;
+  int lane = threadIdx.x % WARP_SIZE;
+  int nwarps = blockDim.x / WARP_SIZE;
+  for (size_t hunk = warp; hunk < fullHunks; hunk += nwarps) {
+    uintptr_t threadSrc = src + packBegin * PackBytes +
+        hunk * HunkBytes + lane * PackBytes;
+    uintptr_t threadDst = dst + packBegin * PackBytes +
+        hunk * HunkBytes + lane * PackBytes;
     BytePack<PackBytes> values[Unroll];
 #pragma unroll
     for (int u = 0; u < Unroll; u++)
-      values[u] = ld_global<PackBytes>(
-          src + (i + u * blockDim.x) * PackBytes);
+      values[u] = ld_global<PackBytes>(threadSrc + u * WarpBytes);
 #pragma unroll
     for (int u = 0; u < Unroll; u++)
-      st_global<PackBytes>(dst + (i + u * blockDim.x) * PackBytes, values[u]);
+      st_global<PackBytes>(threadDst + u * WarpBytes, values[u]);
   }
-  for (; i < packEnd; i += blockDim.x) {
+  size_t remainderBegin = packBegin + fullHunks * HunkBytes / PackBytes;
+  for (size_t i = remainderBegin + threadIdx.x; i < packEnd; i += blockDim.x) {
     BytePack<PackBytes> value = ld_global<PackBytes>(src + i * PackBytes);
     st_global<PackBytes>(dst + i * PackBytes, value);
   }
