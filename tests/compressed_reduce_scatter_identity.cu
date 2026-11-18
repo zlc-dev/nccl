@@ -275,10 +275,37 @@ int runRank(int rank, int nranks, const ncclUniqueId& id, size_t minBytes,
     }
 
     int errors = 0;
+    size_t firstError = recvcount;
+    size_t lastError = 0;
+    size_t firstErrorBlock = recvcount;
+    size_t lastErrorBlock = 0;
+    size_t errorBlocks = 0;
+    size_t previousErrorBlock = recvcount;
     std::vector<float> result(recvcount);
     CUDACHECK(cudaMemcpy(result.data(), recvbuff, bytes, cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < recvcount; i++) {
-      if (result[i] != expectedValue(nranks, rank, i)) errors++;
+      if (result[i] != expectedValue(nranks, rank, i)) {
+        errors++;
+        size_t block = i / blockElements;
+        if (firstError == recvcount) {
+          firstError = i;
+          firstErrorBlock = block;
+        }
+        lastError = i;
+        lastErrorBlock = block;
+        if (block != previousErrorBlock) {
+          errorBlocks++;
+          previousErrorBlock = block;
+        }
+      }
+    }
+    if (errors != 0) {
+      std::fprintf(stderr,
+          "compressed-rs mismatch rank=%d bytes=%zu errors=%d "
+          "elements=%zu..%zu blocks=%zu..%zu blockCount=%zu\n",
+          rank, bytes, errors, firstError, lastError, firstErrorBlock,
+          lastErrorBlock, errorBlocks);
+      std::fflush(stderr);
     }
 
     // Exercise a normal NCCL collective immediately after the compressed
