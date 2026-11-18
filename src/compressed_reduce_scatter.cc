@@ -29,9 +29,20 @@ struct alignas(64) ncclCompressedRsEventSync {
 };
 static_assert(sizeof(ncclCompressedRsEventSync) == 64, "event sync must occupy one cache line");
 
+struct alignas(64) ncclCompressedRsEventRecordSync {
+  uint64_t recordIssued;
+  char padding[64 - sizeof(uint64_t)];
+};
+
+struct ncclCompressedRsEventWindowSync {
+  ncclCompressedRsEventRecordSync generation[NCCL_COMPRESSED_EVENT_GENERATIONS];
+  alignas(64) uint64_t waitIssuedTail;
+  char padding[64 - sizeof(uint64_t)];
+};
+
 struct ncclCompressedRsRxSync {
-  ncclCompressedRsEventSync dataReady;
-  ncclCompressedRsEventSync canWrite;
+  ncclCompressedRsEventWindowSync dataReady;
+  ncclCompressedRsEventWindowSync canWrite;
 };
 
 struct ncclCompressedRsHostSyncPage {
@@ -48,16 +59,18 @@ struct ncclCompressedRsRing {
   bool ownsNextPool = false;
   ncclCompressedRsHostSyncPage* nextSync = nullptr;
   ncclShmHandleInternal* nextSyncHandle = nullptr;
-  cudaEvent_t localDataReady[NCCL_COMPRESSED_RX_DEPTH] = {};
-  cudaEvent_t localCanWrite[NCCL_COMPRESSED_RX_DEPTH] = {};
-  cudaEvent_t nextDataReady[NCCL_COMPRESSED_RX_DEPTH] = {};
-  cudaEvent_t nextCanWrite[NCCL_COMPRESSED_RX_DEPTH] = {};
+  cudaEvent_t localDataReady[NCCL_COMPRESSED_RX_DEPTH][NCCL_COMPRESSED_EVENT_GENERATIONS] = {};
+  cudaEvent_t localCanWrite[NCCL_COMPRESSED_RX_DEPTH][NCCL_COMPRESSED_EVENT_GENERATIONS] = {};
+  cudaEvent_t nextDataReady[NCCL_COMPRESSED_RX_DEPTH][NCCL_COMPRESSED_EVENT_GENERATIONS] = {};
+  cudaEvent_t nextCanWrite[NCCL_COMPRESSED_RX_DEPTH][NCCL_COMPRESSED_EVENT_GENERATIONS] = {};
   cudaEvent_t localPointerClosed = nullptr;
   cudaEvent_t nextPointerClosed = nullptr;
   uint64_t localDataReadyPhase[NCCL_COMPRESSED_RX_DEPTH] = {};
   uint64_t localCanWritePhase[NCCL_COMPRESSED_RX_DEPTH] = {};
   uint64_t nextDataReadyPhase[NCCL_COMPRESSED_RX_DEPTH] = {};
   uint64_t nextCanWritePhase[NCCL_COMPRESSED_RX_DEPTH] = {};
+  uint64_t localDataReadyWaitPublished[NCCL_COMPRESSED_RX_DEPTH] = {};
+  uint64_t nextCanWriteWaitPublished[NCCL_COMPRESSED_RX_DEPTH] = {};
   uint64_t localPointerClosedPhase = 0;
   uint64_t nextPointerClosedPhase = 0;
   cudaStream_t sendStream = nullptr;
@@ -80,15 +93,17 @@ namespace {
 constexpr size_t MinBlockBytes = 512 * 1024;
 constexpr size_t TargetSliceBytes = 256 * 1024;
 constexpr int MaxSliceCtas = 4;
-constexpr int DefaultActiveRings = 2;
+constexpr int DefaultActiveRings = 1;
 constexpr size_t SlotAlignment = 256;
 constexpr size_t PayloadOffset = (sizeof(ncclCompressedP2pSlot) + 15) & ~size_t(15);
 constexpr uint64_t IpcSocketHashSalt = 0x435253504f4f4cULL;
 
 struct ManagerInitInfo {
   char syncPath[PATH_MAX];
-  cudaIpcEventHandle_t dataReady[MAXCHANNELS][NCCL_COMPRESSED_RX_DEPTH];
-  cudaIpcEventHandle_t canWrite[MAXCHANNELS][NCCL_COMPRESSED_RX_DEPTH];
+  cudaIpcEventHandle_t dataReady[MAXCHANNELS][NCCL_COMPRESSED_RX_DEPTH]
+                                    [NCCL_COMPRESSED_EVENT_GENERATIONS];
+  cudaIpcEventHandle_t canWrite[MAXCHANNELS][NCCL_COMPRESSED_RX_DEPTH]
+                                   [NCCL_COMPRESSED_EVENT_GENERATIONS];
   cudaIpcEventHandle_t pointerClosed[MAXCHANNELS];
 };
 
@@ -188,6 +203,23 @@ static ncclResult_t wait(cudaStream_t s, cudaEvent_t e) {
   return ncclSuccess;
 }
 
+static void progressPause(unsigned* spins) {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__)
+  asm volatile("yield" ::: "memory");
+#else
+  asm volatile("" ::: "memory");
+#endif
+  // IPC phase changes normally arrive in a few microseconds. Yielding on every
+  // miss turns that latency into an OS scheduling quantum and leaves visible
+  // holes between communication kernels.
+  if (++*spins == 16384) {
+    *spins = 0;
+    std::this_thread::yield();
+  }
+}
+
 static char traceEventState(cudaEvent_t event) {
   cudaError_t status = CUDACLEARERROR(cudaEventQuery(event));
   return status == cudaSuccess ? 'C' : status == cudaErrorNotReady ? 'P' : 'E';
@@ -210,6 +242,28 @@ static bool canRecordIpcPhase(const ncclCompressedRsEventSync* sync, uint64_t ph
 
 static bool canWaitIpcPhase(const ncclCompressedRsEventSync* sync, uint64_t phase) {
   return __atomic_load_n(&sync->recordIssued, __ATOMIC_ACQUIRE) >= phase;
+}
+
+static int eventGeneration(uint64_t phase) {
+  return static_cast<int>((phase - 1) % NCCL_COMPRESSED_EVENT_GENERATIONS);
+}
+
+static uint64_t eventGenerationPhase(uint64_t phase) {
+  return (phase - 1) / NCCL_COMPRESSED_EVENT_GENERATIONS + 1;
+}
+
+static bool canRecordIpcWindow(
+    const ncclCompressedRsEventWindowSync* sync, uint64_t phase) {
+  uint64_t priorPhase = phase > NCCL_COMPRESSED_EVENT_GENERATIONS
+      ? phase - NCCL_COMPRESSED_EVENT_GENERATIONS : 0;
+  return __atomic_load_n(&sync->waitIssuedTail, __ATOMIC_ACQUIRE) >= priorPhase;
+}
+
+static bool canWaitIpcWindow(
+    const ncclCompressedRsEventWindowSync* sync, uint64_t phase) {
+  int generation = eventGeneration(phase);
+  return __atomic_load_n(&sync->generation[generation].recordIssued,
+                         __ATOMIC_ACQUIRE) >= eventGenerationPhase(phase);
 }
 
 static ncclResult_t tryRecordIpcPhase(
@@ -237,6 +291,48 @@ static ncclResult_t tryWaitIpcPhase(
   *currentPhase = phase;
   *submitted = true;
   return ncclSuccess;
+}
+
+static ncclResult_t tryRecordIpcWindow(
+    cudaEvent_t* events, ncclCompressedRsEventWindowSync* sync,
+    uint64_t* currentPhase, cudaStream_t stream, bool* submitted) {
+  uint64_t phase = *currentPhase + 1;
+  int generation = eventGeneration(phase);
+  uint64_t generationPhase = eventGenerationPhase(phase);
+  *submitted = false;
+  if (!canRecordIpcWindow(sync, phase)) return ncclSuccess;
+  CUDACHECK(cudaEventRecord(events[generation], stream));
+  __atomic_store_n(&sync->generation[generation].recordIssued,
+                   generationPhase, __ATOMIC_RELEASE);
+  *currentPhase = phase;
+  *submitted = true;
+  return ncclSuccess;
+}
+
+static ncclResult_t tryWaitIpcWindow(
+    cudaEvent_t* events, ncclCompressedRsEventWindowSync* sync,
+    uint64_t* currentPhase, cudaStream_t stream, bool* submitted) {
+  uint64_t phase = *currentPhase + 1;
+  int generation = eventGeneration(phase);
+  uint64_t generationPhase = eventGenerationPhase(phase);
+  *submitted = false;
+  if (__atomic_load_n(&sync->generation[generation].recordIssued,
+                      __ATOMIC_ACQUIRE) < generationPhase)
+    return ncclSuccess;
+  CUDACHECK(cudaStreamWaitEvent(stream, events[generation], 0));
+  *currentPhase = phase;
+  *submitted = true;
+  return ncclSuccess;
+}
+
+static void publishWindowWait(
+    ncclCompressedRsEventWindowSync* sync, uint64_t phase,
+    uint64_t* publishedPhase, bool force) {
+  constexpr uint64_t PublishBatch = NCCL_COMPRESSED_EVENT_GENERATIONS;
+  if (phase == *publishedPhase) return;
+  if (!force && phase - *publishedPhase < PublishBatch) return;
+  __atomic_store_n(&sync->waitIssuedTail, phase, __ATOMIC_RELEASE);
+  *publishedPhase = phase;
 }
 
 static ncclResult_t validatePlan(const ncclCompressionPlan_t* p) {
@@ -285,10 +381,14 @@ static ncclResult_t destroyManagerResources(ncclComm* comm, ncclCompressedRsMana
   for (int c = 0; c < m->ringCount; c++) {
     ncclCompressedRsRing& ring = m->rings[c];
     for (int s = 0; s < NCCL_COMPRESSED_RX_DEPTH; s++) {
-      if (ring.nextDataReady[s]) CUDACHECKIGNORE(cudaEventDestroy(ring.nextDataReady[s]));
-      if (ring.nextCanWrite[s]) CUDACHECKIGNORE(cudaEventDestroy(ring.nextCanWrite[s]));
-      ring.nextDataReady[s] = nullptr;
-      ring.nextCanWrite[s] = nullptr;
+      for (int g = 0; g < NCCL_COMPRESSED_EVENT_GENERATIONS; g++) {
+        if (ring.nextDataReady[s][g])
+          CUDACHECKIGNORE(cudaEventDestroy(ring.nextDataReady[s][g]));
+        if (ring.nextCanWrite[s][g])
+          CUDACHECKIGNORE(cudaEventDestroy(ring.nextCanWrite[s][g]));
+        ring.nextDataReady[s][g] = nullptr;
+        ring.nextCanWrite[s][g] = nullptr;
+      }
     }
     if (ring.nextPointerClosed) CUDACHECKIGNORE(cudaEventDestroy(ring.nextPointerClosed));
     ring.nextPointerClosed = nullptr;
@@ -327,18 +427,26 @@ done:
   for (int c = 0; c < m->ringCount; c++) {
     ncclCompressedRsRing& ring = m->rings[c];
     for (int s = 0; s < NCCL_COMPRESSED_RX_DEPTH; s++) {
-      if (ring.nextDataReady[s]) CUDACHECKIGNORE(cudaEventDestroy(ring.nextDataReady[s]));
-      if (ring.nextCanWrite[s]) CUDACHECKIGNORE(cudaEventDestroy(ring.nextCanWrite[s]));
-      if (ring.localDataReady[s]) CUDACHECKIGNORE(cudaEventDestroy(ring.localDataReady[s]));
-      if (ring.localCanWrite[s]) CUDACHECKIGNORE(cudaEventDestroy(ring.localCanWrite[s]));
-      ring.nextDataReady[s] = nullptr;
-      ring.nextCanWrite[s] = nullptr;
-      ring.localDataReady[s] = nullptr;
-      ring.localCanWrite[s] = nullptr;
+      for (int g = 0; g < NCCL_COMPRESSED_EVENT_GENERATIONS; g++) {
+        if (ring.nextDataReady[s][g])
+          CUDACHECKIGNORE(cudaEventDestroy(ring.nextDataReady[s][g]));
+        if (ring.nextCanWrite[s][g])
+          CUDACHECKIGNORE(cudaEventDestroy(ring.nextCanWrite[s][g]));
+        if (ring.localDataReady[s][g])
+          CUDACHECKIGNORE(cudaEventDestroy(ring.localDataReady[s][g]));
+        if (ring.localCanWrite[s][g])
+          CUDACHECKIGNORE(cudaEventDestroy(ring.localCanWrite[s][g]));
+        ring.nextDataReady[s][g] = nullptr;
+        ring.nextCanWrite[s][g] = nullptr;
+        ring.localDataReady[s][g] = nullptr;
+        ring.localCanWrite[s][g] = nullptr;
+      }
       ring.localDataReadyPhase[s] = 0;
       ring.localCanWritePhase[s] = 0;
       ring.nextDataReadyPhase[s] = 0;
       ring.nextCanWritePhase[s] = 0;
+      ring.localDataReadyWaitPublished[s] = 0;
+      ring.nextCanWriteWaitPublished[s] = 0;
     }
     if (ring.nextPointerClosed) CUDACHECKIGNORE(cudaEventDestroy(ring.nextPointerClosed));
     if (ring.localPointerClosed) CUDACHECKIGNORE(cudaEventDestroy(ring.localPointerClosed));
@@ -441,14 +549,16 @@ static ncclResult_t initializeManager(Operation* op) {
     __atomic_store_n(&m->localSync->importsClosed[c], 0, __ATOMIC_RELAXED);
     CUDACHECKGOTO(cudaStreamCreateWithFlags(&ring.sendStream, cudaStreamNonBlocking), ret, fail);
     for (int s = 0; s < NCCL_COMPRESSED_RX_DEPTH; s++) {
-      CUDACHECKGOTO(cudaEventCreateWithFlags(&ring.localDataReady[s],
-          cudaEventDisableTiming | cudaEventInterprocess), ret, fail);
-      CUDACHECKGOTO(cudaEventCreateWithFlags(&ring.localCanWrite[s],
-          cudaEventDisableTiming | cudaEventInterprocess), ret, fail);
-      CUDACHECKGOTO(cudaIpcGetEventHandle(&localInfo.dataReady[c][s],
-                                          ring.localDataReady[s]), ret, fail);
-      CUDACHECKGOTO(cudaIpcGetEventHandle(&localInfo.canWrite[c][s],
-                                          ring.localCanWrite[s]), ret, fail);
+      for (int g = 0; g < NCCL_COMPRESSED_EVENT_GENERATIONS; g++) {
+        CUDACHECKGOTO(cudaEventCreateWithFlags(&ring.localDataReady[s][g],
+            cudaEventDisableTiming | cudaEventInterprocess), ret, fail);
+        CUDACHECKGOTO(cudaEventCreateWithFlags(&ring.localCanWrite[s][g],
+            cudaEventDisableTiming | cudaEventInterprocess), ret, fail);
+        CUDACHECKGOTO(cudaIpcGetEventHandle(&localInfo.dataReady[c][s][g],
+                                            ring.localDataReady[s][g]), ret, fail);
+        CUDACHECKGOTO(cudaIpcGetEventHandle(&localInfo.canWrite[c][s][g],
+                                            ring.localCanWrite[s][g]), ret, fail);
+      }
     }
     CUDACHECKGOTO(cudaEventCreateWithFlags(&ring.localPointerClosed,
         cudaEventDisableTiming | cudaEventInterprocess), ret, fail);
@@ -495,10 +605,12 @@ static ncclResult_t initializeManager(Operation* op) {
         reinterpret_cast<void**>(&ring.nextSync), nullptr, 0,
         &ring.nextSyncHandle), ret, fail);
     for (int s = 0; s < NCCL_COMPRESSED_RX_DEPTH; s++) {
-      CUDACHECKGOTO(cudaIpcOpenEventHandle(&ring.nextDataReady[s],
-          allInfo[ring.next].dataReady[c][s]), ret, fail);
-      CUDACHECKGOTO(cudaIpcOpenEventHandle(&ring.nextCanWrite[s],
-          allInfo[ring.next].canWrite[c][s]), ret, fail);
+      for (int g = 0; g < NCCL_COMPRESSED_EVENT_GENERATIONS; g++) {
+        CUDACHECKGOTO(cudaIpcOpenEventHandle(&ring.nextDataReady[s][g],
+            allInfo[ring.next].dataReady[c][s][g]), ret, fail);
+        CUDACHECKGOTO(cudaIpcOpenEventHandle(&ring.nextCanWrite[s][g],
+            allInfo[ring.next].canWrite[c][s][g]), ret, fail);
+      }
     }
     CUDACHECKGOTO(cudaIpcOpenEventHandle(&ring.nextPointerClosed,
         allInfo[ring.next].pointerClosed[c]), ret, fail);
@@ -537,8 +649,10 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
   std::vector<int> destinations(nblocks);
   if (traceEnabled()) {
     std::fprintf(stderr,
-        "compressed-rs rank=%d sequence=%llu phase=enqueue-config rings=%d blocks=%zu\n",
-        comm->rank, static_cast<unsigned long long>(op->sequence), activeRings, nblocks);
+        "compressed-rs rank=%d sequence=%llu phase=enqueue-config "
+        "rings=%d blocks=%zu eventWindow=%d\n",
+        comm->rank, static_cast<unsigned long long>(op->sequence), activeRings,
+        nblocks, NCCL_COMPRESSED_EVENT_GENERATIONS);
     std::fflush(stderr);
   }
   trace(op, "enqueue-begin");
@@ -625,6 +739,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
     // dependency. No stage waits for GPU completion on the Host.
     auto nextStallTrace = std::chrono::steady_clock::now() +
         std::chrono::seconds(2);
+    unsigned pipelineSpins = 0;
     for (;;) {
       bool done = true;
       bool progressed = false;
@@ -643,7 +758,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
         for (int lane = 0; lane < NCCL_COMPRESSED_RX_DEPTH; lane++) {
           if (!state.localCreditPending[lane]) continue;
           bool submitted = false;
-          NCCLCHECKGOTO(tryRecordIpcPhase(ring.localCanWrite[lane],
+          NCCLCHECKGOTO(tryRecordIpcWindow(ring.localCanWrite[lane],
               &m->localSync->rx[c][lane].canWrite,
               &ring.localCanWritePhase[lane], cs, &submitted), ret, fail);
           if (submitted) {
@@ -663,21 +778,23 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
         for (int token = state.batchCount - 1; token >= 0; token--) {
           if (!state.initialPending[token]) continue;
           int lane = token;
-          ncclCompressedRsEventSync* credit = &ring.nextSync->rx[c][lane].canWrite;
-          ncclCompressedRsEventSync* ready = &ring.nextSync->rx[c][lane].dataReady;
-          if (!canWaitIpcPhase(credit, ring.nextCanWritePhase[lane] + 1) ||
-              !canRecordIpcPhase(ready, ring.nextDataReadyPhase[lane] + 1))
+          ncclCompressedRsEventWindowSync* credit = &ring.nextSync->rx[c][lane].canWrite;
+          ncclCompressedRsEventWindowSync* ready = &ring.nextSync->rx[c][lane].dataReady;
+          if (!canWaitIpcWindow(credit, ring.nextCanWritePhase[lane] + 1) ||
+              !canRecordIpcWindow(ready, ring.nextDataReadyPhase[lane] + 1))
             continue;
           bool submitted = false;
-          NCCLCHECKGOTO(tryWaitIpcPhase(ring.nextCanWrite[lane], credit,
+          NCCLCHECKGOTO(tryWaitIpcWindow(ring.nextCanWrite[lane], credit,
               &ring.nextCanWritePhase[lane], ring.sendStream, &submitted), ret, fail);
           if (!submitted) { ret = ncclInternalError; goto fail; }
+          publishWindowWait(credit, ring.nextCanWritePhase[lane],
+              &ring.nextCanWriteWaitPublished[lane], false);
           size_t block = state.blocks[token];
           void* source = slot(op->preencoded, op->stride, block);
           NCCLCHECKGOTO(ncclLaunchCompressedSend(source,
               slot(ringOp.remoteRx, op->stride, lane), op->stride, capacity,
               1, ctasPerSegment, ring.sendStream), ret, fail);
-          NCCLCHECKGOTO(tryRecordIpcPhase(ring.nextDataReady[lane], ready,
+          NCCLCHECKGOTO(tryRecordIpcWindow(ring.nextDataReady[lane], ready,
               &ring.nextDataReadyPhase[lane], ring.sendStream, &submitted), ret, fail);
           if (!submitted) { ret = ncclInternalError; goto fail; }
           state.remoteLaneUsed[lane] = true;
@@ -697,10 +814,10 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           if (state.token < 0) continue;
           int token = state.token;
           int lane = (token + state.round) % NCCL_COMPRESSED_RX_DEPTH;
-          ncclCompressedRsEventSync* ready = &m->localSync->rx[c][lane].dataReady;
-          ncclCompressedRsEventSync* credit = &m->localSync->rx[c][lane].canWrite;
-          if (!canWaitIpcPhase(ready, ring.localDataReadyPhase[lane] + 1) ||
-              !canRecordIpcPhase(credit, ring.localCanWritePhase[lane] + 1))
+          ncclCompressedRsEventWindowSync* ready = &m->localSync->rx[c][lane].dataReady;
+          ncclCompressedRsEventWindowSync* credit = &m->localSync->rx[c][lane].canWrite;
+          if (!canWaitIpcWindow(ready, ring.localDataReadyPhase[lane] + 1) ||
+              !canRecordIpcWindow(credit, ring.localCanWritePhase[lane] + 1))
             continue;
           size_t block = state.blocks[token];
           uint32_t round = state.round;
@@ -708,22 +825,27 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           int remoteLane = (token + round + 1) % NCCL_COMPRESSED_RX_DEPTH;
           if (!final) {
             ncclCompressedRsRxSync* next = &ring.nextSync->rx[c][remoteLane];
-            if (!canWaitIpcPhase(&next->canWrite,
+            if (!canWaitIpcWindow(&next->canWrite,
                                  ring.nextCanWritePhase[remoteLane] + 1) ||
-                !canRecordIpcPhase(&next->dataReady,
+                !canRecordIpcWindow(&next->dataReady,
                                    ring.nextDataReadyPhase[remoteLane] + 1))
               continue;
           }
           bool submitted = false;
-          NCCLCHECKGOTO(tryWaitIpcPhase(ring.localDataReady[lane], ready,
+          NCCLCHECKGOTO(tryWaitIpcWindow(ring.localDataReady[lane], ready,
               &ring.localDataReadyPhase[lane], j->stream, &submitted), ret, fail);
           if (!submitted) { ret = ncclInternalError; goto fail; }
+          publishWindowWait(ready, ring.localDataReadyPhase[lane],
+              &ring.localDataReadyWaitPublished[lane], false);
           if (!final) {
             ncclCompressedRsRxSync* next = &ring.nextSync->rx[c][remoteLane];
-            NCCLCHECKGOTO(tryWaitIpcPhase(ring.nextCanWrite[remoteLane],
+            NCCLCHECKGOTO(tryWaitIpcWindow(ring.nextCanWrite[remoteLane],
                 &next->canWrite, &ring.nextCanWritePhase[remoteLane],
                 j->stream, &submitted), ret, fail);
             if (!submitted) { ret = ncclInternalError; goto fail; }
+            publishWindowWait(&next->canWrite,
+                ring.nextCanWritePhase[remoteLane],
+                &ring.nextCanWriteWaitPublished[remoteLane], false);
           }
           int dst = comm->channels[c].ring.userRanks[comm->nRanks - 2 - round];
           size_t off = block * j->plan.blockElements;
@@ -747,11 +869,11 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           else
             NCCLCHECKGOTO(j->plan.decodeReduceEncode(task,
                 j->datatype, j->op, j->plan.context, j->stream), ret, fail);
-          NCCLCHECKGOTO(tryRecordIpcPhase(ring.localCanWrite[lane], credit,
+          NCCLCHECKGOTO(tryRecordIpcWindow(ring.localCanWrite[lane], credit,
               &ring.localCanWritePhase[lane], j->stream, &submitted), ret, fail);
           if (!submitted) { ret = ncclInternalError; goto fail; }
           if (!final) {
-            NCCLCHECKGOTO(tryRecordIpcPhase(ring.nextDataReady[remoteLane],
+            NCCLCHECKGOTO(tryRecordIpcWindow(ring.nextDataReady[remoteLane],
                 &ring.nextSync->rx[c][remoteLane].dataReady,
                 &ring.nextDataReadyPhase[remoteLane], j->stream, &submitted), ret, fail);
             if (!submitted) { ret = ncclInternalError; goto fail; }
@@ -784,6 +906,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           progressed = true;
         }
       }
+      if (progressed) pipelineSpins = 0;
       if (!progressed) {
         if (traceEnabled() && std::chrono::steady_clock::now() >= nextStallTrace) {
           std::fprintf(stderr,
@@ -806,23 +929,25 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
               ncclCompressedRsRxSync* local = &m->localSync->rx[c][lane];
               ncclCompressedRsRxSync* next = &ring.nextSync->rx[c][lane];
               std::fprintf(stderr,
-                  "    lane=%d localReady=%llu/%llu localCredit=%llu/%llu(%c) "
-                  "nextReady=%llu/%llu nextCredit=%llu/%llu(%c)\n",
+                  "    lane=%d localReady=%llu/%c localCredit=%llu/%c(%c) "
+                  "nextReady=%llu/%c nextCredit=%llu/%c(%c)\n",
                   lane,
                   static_cast<unsigned long long>(ring.localDataReadyPhase[lane]),
-                  static_cast<unsigned long long>(__atomic_load_n(
-                      &local->dataReady.recordIssued, __ATOMIC_ACQUIRE)),
+                  canWaitIpcWindow(&local->dataReady,
+                      ring.localDataReadyPhase[lane] + 1) ? 'R' : 'P',
                   static_cast<unsigned long long>(ring.localCanWritePhase[lane]),
-                  static_cast<unsigned long long>(__atomic_load_n(
-                      &local->canWrite.recordIssued, __ATOMIC_ACQUIRE)),
-                  traceEventState(ring.localCanWrite[lane]),
+                  canRecordIpcWindow(&local->canWrite,
+                      ring.localCanWritePhase[lane] + 1) ? 'R' : 'P',
+                  traceEventState(ring.localCanWrite[lane][eventGeneration(
+                      ring.localCanWritePhase[lane] + 1)]),
                   static_cast<unsigned long long>(ring.nextDataReadyPhase[lane]),
-                  static_cast<unsigned long long>(__atomic_load_n(
-                      &next->dataReady.recordIssued, __ATOMIC_ACQUIRE)),
+                  canRecordIpcWindow(&next->dataReady,
+                      ring.nextDataReadyPhase[lane] + 1) ? 'R' : 'P',
                   static_cast<unsigned long long>(ring.nextCanWritePhase[lane]),
-                  static_cast<unsigned long long>(__atomic_load_n(
-                      &next->canWrite.recordIssued, __ATOMIC_ACQUIRE)),
-                  traceEventState(ring.nextCanWrite[lane]));
+                  canWaitIpcWindow(&next->canWrite,
+                      ring.nextCanWritePhase[lane] + 1) ? 'R' : 'P',
+                  traceEventState(ring.nextCanWrite[lane][eventGeneration(
+                      ring.nextCanWritePhase[lane] + 1)]));
             }
           }
           std::fflush(stderr);
@@ -834,7 +959,22 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           ret = ncclSystemError;
           goto fail;
         }
-        std::this_thread::yield();
+        progressPause(&pipelineSpins);
+      }
+    }
+
+    // Publish any partial acknowledgement batch before closing this
+    // operation. Ready/credit records were already published immediately;
+    // these cumulative tails only release Event generations for later reuse.
+    for (int c = 0; c < activeRings; c++) {
+      ncclCompressedRsRing& ring = m->rings[c];
+      for (int lane = 0; lane < NCCL_COMPRESSED_RX_DEPTH; lane++) {
+        publishWindowWait(&m->localSync->rx[c][lane].dataReady,
+            ring.localDataReadyPhase[lane],
+            &ring.localDataReadyWaitPublished[lane], true);
+        publishWindowWait(&ring.nextSync->rx[c][lane].canWrite,
+            ring.nextCanWritePhase[lane],
+            &ring.nextCanWriteWaitPublished[lane], true);
       }
     }
 
@@ -842,6 +982,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
     // imported pointer. A separate IPC Event then closes pointer ownership.
     auto nextCloseTrace = std::chrono::steady_clock::now() +
         std::chrono::seconds(2);
+    unsigned closeSpins = 0;
     for (;;) {
       bool closed = true;
       bool progressed = false;
@@ -854,10 +995,13 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
             continue;
           creditsDone = false;
           bool submitted = false;
-          NCCLCHECKGOTO(tryWaitIpcPhase(ring.nextCanWrite[lane],
+          NCCLCHECKGOTO(tryWaitIpcWindow(ring.nextCanWrite[lane],
               &ring.nextSync->rx[c][lane].canWrite,
               &ring.nextCanWritePhase[lane], ring.sendStream, &submitted), ret, fail);
           if (submitted) {
+            publishWindowWait(&ring.nextSync->rx[c][lane].canWrite,
+                ring.nextCanWritePhase[lane],
+                &ring.nextCanWriteWaitPublished[lane], true);
             state.finalCreditWaited[lane] = true;
             progressed = true;
           }
@@ -890,6 +1034,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           }
         }
       }
+      if (progressed) closeSpins = 0;
       if (closed) break;
       if (!progressed) {
         if (traceEnabled() && std::chrono::steady_clock::now() >= nextCloseTrace) {
@@ -902,13 +1047,13 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
                 comm->rank, static_cast<unsigned long long>(op->sequence), c,
                 state.remotePointerClosed, state.localPointerClosed);
             for (int lane = 0; lane < NCCL_COMPRESSED_RX_DEPTH; lane++) {
-              std::fprintf(stderr, " lane%d=%d/%d:%llu/%llu(%c)", lane,
+              std::fprintf(stderr, " lane%d=%d/%d:%llu/%c(%c)", lane,
                   state.remoteLaneUsed[lane], state.finalCreditWaited[lane],
                   static_cast<unsigned long long>(ring.nextCanWritePhase[lane]),
-                  static_cast<unsigned long long>(__atomic_load_n(
-                      &ring.nextSync->rx[c][lane].canWrite.recordIssued,
-                      __ATOMIC_ACQUIRE)),
-                  traceEventState(ring.nextCanWrite[lane]));
+                  canWaitIpcWindow(&ring.nextSync->rx[c][lane].canWrite,
+                      ring.nextCanWritePhase[lane] + 1) ? 'R' : 'P',
+                  traceEventState(ring.nextCanWrite[lane][eventGeneration(
+                      ring.nextCanWritePhase[lane] + 1)]));
             }
             std::fputc('\n', stderr);
           }
@@ -921,7 +1066,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           ret = ncclSystemError;
           goto fail;
         }
-        std::this_thread::yield();
+        progressPause(&closeSpins);
       }
     }
     for (int c = 0; c < activeRings; c++) {
