@@ -22,13 +22,6 @@
 #include <thread>
 #include <vector>
 
-struct alignas(64) ncclCompressedRsEventSync {
-  uint64_t recordIssued;
-  uint64_t waitIssued;
-  char padding[64 - 2 * sizeof(uint64_t)];
-};
-static_assert(sizeof(ncclCompressedRsEventSync) == 64, "event sync must occupy one cache line");
-
 struct alignas(64) ncclCompressedRsEventRecordSync {
   uint64_t recordIssued;
   char padding[64 - sizeof(uint64_t)];
@@ -47,7 +40,6 @@ struct ncclCompressedRsRxSync {
 
 struct ncclCompressedRsHostSyncPage {
   ncclCompressedRsRxSync rx[MAXCHANNELS][NCCL_COMPRESSED_RX_DEPTH];
-  ncclCompressedRsEventSync pointerClosed[MAXCHANNELS];
   uint64_t importsClosed[MAXCHANNELS];
 };
 
@@ -63,17 +55,16 @@ struct ncclCompressedRsRing {
   cudaEvent_t localCanWrite[NCCL_COMPRESSED_RX_DEPTH][NCCL_COMPRESSED_EVENT_GENERATIONS] = {};
   cudaEvent_t nextDataReady[NCCL_COMPRESSED_RX_DEPTH][NCCL_COMPRESSED_EVENT_GENERATIONS] = {};
   cudaEvent_t nextCanWrite[NCCL_COMPRESSED_RX_DEPTH][NCCL_COMPRESSED_EVENT_GENERATIONS] = {};
-  cudaEvent_t localPointerClosed = nullptr;
-  cudaEvent_t nextPointerClosed = nullptr;
   uint64_t localDataReadyPhase[NCCL_COMPRESSED_RX_DEPTH] = {};
   uint64_t localCanWritePhase[NCCL_COMPRESSED_RX_DEPTH] = {};
   uint64_t nextDataReadyPhase[NCCL_COMPRESSED_RX_DEPTH] = {};
   uint64_t nextCanWritePhase[NCCL_COMPRESSED_RX_DEPTH] = {};
   uint64_t localDataReadyWaitPublished[NCCL_COMPRESSED_RX_DEPTH] = {};
   uint64_t nextCanWriteWaitPublished[NCCL_COMPRESSED_RX_DEPTH] = {};
-  uint64_t localPointerClosedPhase = 0;
-  uint64_t nextPointerClosedPhase = 0;
+  bool localCreditInitialized[NCCL_COMPRESSED_RX_DEPTH] = {};
   cudaStream_t sendStream = nullptr;
+  void* cachedRx = nullptr;
+  void* cachedRemoteRx = nullptr;
 };
 
 struct ncclCompressedRsManager {
@@ -85,6 +76,12 @@ struct ncclCompressedRsManager {
   int ringCount = 0;
   cudaEvent_t tail = nullptr;
   uint64_t sequence = 0;
+  size_t cachedStride = 0;
+  int cachedRingCount = 0;
+  void* cachedPreencoded = nullptr;
+  ncclCompressionTask_t* cachedPreencodeTasks = nullptr;
+  int* cachedPreencodeDestinations = nullptr;
+  size_t cachedPreencodeBlocks = 0;
   bool tailRecorded = false;
   bool initialized = false;
 };
@@ -104,7 +101,6 @@ struct ManagerInitInfo {
                                     [NCCL_COMPRESSED_EVENT_GENERATIONS];
   cudaIpcEventHandle_t canWrite[MAXCHANNELS][NCCL_COMPRESSED_RX_DEPTH]
                                    [NCCL_COMPRESSED_EVENT_GENERATIONS];
-  cudaIpcEventHandle_t pointerClosed[MAXCHANNELS];
 };
 
 struct OperationRing {
@@ -138,8 +134,6 @@ struct Job {
 struct RingLaunchState {
   cudaEvent_t finish = nullptr;
   bool localCreditPending[NCCL_COMPRESSED_RX_DEPTH] = {};
-  bool remoteLaneUsed[NCCL_COMPRESSED_RX_DEPTH] = {};
-  bool finalCreditWaited[NCCL_COMPRESSED_RX_DEPTH] = {};
   size_t blocks[NCCL_COMPRESSED_RX_DEPTH - 1] = {};
   int baseLanes[NCCL_COMPRESSED_RX_DEPTH - 1] = {};
   bool initialPending[NCCL_COMPRESSED_RX_DEPTH - 1] = {};
@@ -153,8 +147,6 @@ struct RingLaunchState {
   size_t nextBlockOrdinal = 0;
   size_t completedBlocks = 0;
   size_t blockCount = 0;
-  bool remotePointerClosed = false;
-  bool localPointerClosed = false;
 };
 
 static size_t alignUp(size_t n, size_t a) { return (n + a - 1) / a * a; }
@@ -241,15 +233,6 @@ static ncclResult_t waitHostPhase(ncclComm* comm, uint64_t* address, uint64_t ph
   return ncclSuccess;
 }
 
-static bool canRecordIpcPhase(const ncclCompressedRsEventSync* sync, uint64_t phase) {
-  return phase != 0 &&
-      __atomic_load_n(&sync->waitIssued, __ATOMIC_ACQUIRE) >= phase - 1;
-}
-
-static bool canWaitIpcPhase(const ncclCompressedRsEventSync* sync, uint64_t phase) {
-  return __atomic_load_n(&sync->recordIssued, __ATOMIC_ACQUIRE) >= phase;
-}
-
 static int eventGeneration(uint64_t phase) {
   return static_cast<int>((phase - 1) % NCCL_COMPRESSED_EVENT_GENERATIONS);
 }
@@ -270,33 +253,6 @@ static bool canWaitIpcWindow(
   int generation = eventGeneration(phase);
   return __atomic_load_n(&sync->generation[generation].recordIssued,
                          __ATOMIC_ACQUIRE) >= eventGenerationPhase(phase);
-}
-
-static ncclResult_t tryRecordIpcPhase(
-    cudaEvent_t event, ncclCompressedRsEventSync* sync, uint64_t* currentPhase,
-    cudaStream_t stream, bool* submitted) {
-  uint64_t phase = *currentPhase + 1;
-  *submitted = false;
-  if (!canRecordIpcPhase(sync, phase)) return ncclSuccess;
-  CUDACHECK(cudaEventRecord(event, stream));
-  __atomic_store_n(&sync->recordIssued, phase, __ATOMIC_RELEASE);
-  *currentPhase = phase;
-  *submitted = true;
-  return ncclSuccess;
-}
-
-static ncclResult_t tryWaitIpcPhase(
-    cudaEvent_t event, ncclCompressedRsEventSync* sync, uint64_t* currentPhase,
-    cudaStream_t stream, bool* submitted) {
-  uint64_t phase = *currentPhase + 1;
-  *submitted = false;
-  // recordIssued means cudaEventRecord has been submitted, not completed.
-  if (!canWaitIpcPhase(sync, phase)) return ncclSuccess;
-  CUDACHECK(cudaStreamWaitEvent(stream, event, 0));
-  __atomic_store_n(&sync->waitIssued, phase, __ATOMIC_RELEASE);
-  *currentPhase = phase;
-  *submitted = true;
-  return ncclSuccess;
 }
 
 static ncclResult_t tryRecordIpcWindow(
@@ -380,6 +336,14 @@ static ncclResult_t destroyManagerResources(ncclComm* comm, ncclCompressedRsMana
     if (ring.sendStream) CUDACHECKIGNORE(cudaStreamDestroy(ring.sendStream));
     ring.sendStream = nullptr;
   }
+  // Cached remote pointers must be dropped before their imported pools. The
+  // allocations they reference remain owned by the next rank until every
+  // importer publishes importsClosed below.
+  for (int c = 0; c < m->cachedRingCount; c++) {
+    ncclCompressedRsRing& ring = m->rings[c];
+    if (ring.cachedRemoteRx) CUDACHECKIGNORE(cudaFree(ring.cachedRemoteRx));
+    ring.cachedRemoteRx = nullptr;
+  }
   // Drop every imported CUDA object first. The next rank owns these objects,
   // so publish the Host-side acknowledgement before waiting for the previous
   // rank to drop the objects exported by this rank.
@@ -396,8 +360,6 @@ static ncclResult_t destroyManagerResources(ncclComm* comm, ncclCompressedRsMana
         ring.nextCanWrite[s][g] = nullptr;
       }
     }
-    if (ring.nextPointerClosed) CUDACHECKIGNORE(cudaEventDestroy(ring.nextPointerClosed));
-    ring.nextPointerClosed = nullptr;
   }
   traceDestroy(comm, "imported-events-close-end");
   traceDestroy(comm, "imported-pool-close-begin");
@@ -428,6 +390,21 @@ static ncclResult_t destroyManagerResources(ncclComm* comm, ncclCompressedRsMana
       NCCLCHECKGOTO(waitHostPhase(comm, &m->localSync->importsClosed[c], 1), ret, done);
     traceDestroy(comm, "peer-imports-wait-end");
   }
+  for (int c = 0; c < m->cachedRingCount; c++) {
+    ncclCompressedRsRing& ring = m->rings[c];
+    if (ring.cachedRx) CUDACHECKIGNORE(cudaFree(ring.cachedRx));
+    ring.cachedRx = nullptr;
+  }
+  if (m->cachedPreencoded) CUDACHECKIGNORE(cudaFree(m->cachedPreencoded));
+  if (m->cachedPreencodeTasks) CUDACHECKIGNORE(cudaFree(m->cachedPreencodeTasks));
+  if (m->cachedPreencodeDestinations)
+    CUDACHECKIGNORE(cudaFree(m->cachedPreencodeDestinations));
+  m->cachedPreencoded = nullptr;
+  m->cachedPreencodeTasks = nullptr;
+  m->cachedPreencodeDestinations = nullptr;
+  m->cachedPreencodeBlocks = 0;
+  m->cachedStride = 0;
+  m->cachedRingCount = 0;
 done:
   traceDestroy(comm, "local-events-close-begin");
   for (int c = 0; c < m->ringCount; c++) {
@@ -454,12 +431,6 @@ done:
       ring.localDataReadyWaitPublished[s] = 0;
       ring.nextCanWriteWaitPublished[s] = 0;
     }
-    if (ring.nextPointerClosed) CUDACHECKIGNORE(cudaEventDestroy(ring.nextPointerClosed));
-    if (ring.localPointerClosed) CUDACHECKIGNORE(cudaEventDestroy(ring.localPointerClosed));
-    ring.nextPointerClosed = nullptr;
-    ring.localPointerClosed = nullptr;
-    ring.localPointerClosedPhase = 0;
-    ring.nextPointerClosedPhase = 0;
     if (ring.nextSyncHandle) (void)ncclOsShmClose(ring.nextSyncHandle);
     ring.nextSyncHandle = nullptr;
     ring.nextSync = nullptr;
@@ -475,6 +446,9 @@ done:
   traceDestroy(comm, "local-pool-close-end");
   m->localPool = nullptr;
   m->ringCount = 0;
+  m->cachedStride = 0;
+  m->cachedRingCount = 0;
+  m->cachedPreencodeBlocks = 0;
   m->tailRecorded = false;
   m->initialized = false;
   if (savedDev >= 0) CUDACHECKIGNORE(cudaSetDevice(savedDev));
@@ -566,10 +540,6 @@ static ncclResult_t initializeManager(Operation* op) {
                                             ring.localCanWrite[s][g]), ret, fail);
       }
     }
-    CUDACHECKGOTO(cudaEventCreateWithFlags(&ring.localPointerClosed,
-        cudaEventDisableTiming | cudaEventInterprocess), ret, fail);
-    CUDACHECKGOTO(cudaIpcGetEventHandle(&localInfo.pointerClosed[c],
-                                        ring.localPointerClosed), ret, fail);
   }
   CUDACHECKGOTO(cudaMemPoolExportToShareableHandle(&exportedFd, m->localPool,
                                                    cudaMemHandleTypePosixFileDescriptor, 0), ret, fail);
@@ -618,8 +588,6 @@ static ncclResult_t initializeManager(Operation* op) {
             allInfo[ring.next].canWrite[c][s][g]), ret, fail);
       }
     }
-    CUDACHECKGOTO(cudaIpcOpenEventHandle(&ring.nextPointerClosed,
-        allInfo[ring.next].pointerClosed[c]), ret, fail);
   }
   m->initialized = true;
   trace(op, "connection-ready");
@@ -631,32 +599,131 @@ fail:
   return ret;
 }
 
+static ncclResult_t ensureCachedResources(
+    Operation* op, int activeRings, size_t requiredStride, size_t requiredBlocks,
+    cudaStream_t stream, bool* rebuilt) {
+  ncclResult_t ret = ncclSuccess;
+  ncclComm* comm = op->comm;
+  ncclCompressedRsManager* m = op->manager;
+  bool rebuildRx = m->cachedRingCount < activeRings ||
+      m->cachedStride < requiredStride;
+  size_t oldStride = m->cachedStride;
+  *rebuilt = rebuildRx;
+
+  if (rebuildRx) {
+    int newRingCount = std::max(m->cachedRingCount, activeRings);
+    size_t newStride = std::max(m->cachedStride, requiredStride);
+    if (newStride > SIZE_MAX / NCCL_COMPRESSED_RX_DEPTH) return ncclInvalidArgument;
+    size_t arenaBytes = newStride * NCCL_COMPRESSED_RX_DEPTH;
+
+    if (m->cachedRingCount != 0) {
+      // Pointer replacement is rare (capacity/ring growth). Make it a
+      // collective generation transition: all ranks finish the old DAG,
+      // release imports, then owners release and replace their allocations.
+      if (m->tailRecorded) CUDACHECKGOTO(cudaEventSynchronize(m->tail), ret, fail);
+      NCCLCHECKGOTO(bootstrapBarrier(comm->bootstrap, comm->rank, comm->nRanks,
+          0x43525210), ret, fail);
+      for (int c = 0; c < m->cachedRingCount; c++) {
+        ncclCompressedRsRing& ring = m->rings[c];
+        if (ring.cachedRemoteRx) CUDACHECKGOTO(cudaFree(ring.cachedRemoteRx), ret, fail);
+        ring.cachedRemoteRx = nullptr;
+      }
+      NCCLCHECKGOTO(bootstrapBarrier(comm->bootstrap, comm->rank, comm->nRanks,
+          0x43525211), ret, fail);
+      for (int c = 0; c < m->cachedRingCount; c++) {
+        ncclCompressedRsRing& ring = m->rings[c];
+        if (ring.cachedRx) CUDACHECKGOTO(cudaFree(ring.cachedRx), ret, fail);
+        ring.cachedRx = nullptr;
+      }
+    }
+
+    std::vector<cudaMemPoolPtrExportData> allRxData(
+        static_cast<size_t>(comm->nRanks) * newRingCount);
+    for (int c = 0; c < newRingCount; c++) {
+      ncclCompressedRsRing& ring = m->rings[c];
+      CUDACHECKGOTO(cudaMallocFromPoolAsync(
+          &ring.cachedRx, arenaBytes, m->localPool, stream), ret, fail);
+      CUDACHECKGOTO(cudaMemsetAsync(ring.cachedRx, 0, arenaBytes, stream), ret, fail);
+    }
+    // Exporting a pool allocation and publishing it to another process must
+    // happen after the allocation command has completed.
+    CUDACHECKGOTO(cudaStreamSynchronize(stream), ret, fail);
+    for (int c = 0; c < newRingCount; c++) {
+      CUDACHECKGOTO(cudaMemPoolExportPointer(
+          &allRxData[static_cast<size_t>(comm->rank) * newRingCount + c],
+          m->rings[c].cachedRx), ret, fail);
+    }
+    NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allRxData.data(),
+        sizeof(cudaMemPoolPtrExportData) * newRingCount), ret, fail);
+    for (int c = 0; c < newRingCount; c++) {
+      ncclCompressedRsRing& ring = m->rings[c];
+      CUDACHECKGOTO(cudaMemPoolImportPointer(&ring.cachedRemoteRx, ring.nextPool,
+          &allRxData[static_cast<size_t>(ring.next) * newRingCount + c]), ret, fail);
+    }
+    m->cachedStride = newStride;
+    m->cachedRingCount = newRingCount;
+  }
+
+  if (m->cachedPreencodeBlocks < requiredBlocks || oldStride != m->cachedStride) {
+    *rebuilt = true;
+    if (m->cachedStride > SIZE_MAX / requiredBlocks ||
+        sizeof(*m->cachedPreencodeTasks) > SIZE_MAX / requiredBlocks)
+      return ncclInvalidArgument;
+    if (m->tailRecorded) NCCLCHECKGOTO(wait(stream, m->tail), ret, fail);
+    if (m->cachedPreencoded)
+      CUDACHECKGOTO(cudaFreeAsync(m->cachedPreencoded, stream), ret, fail);
+    if (m->cachedPreencodeTasks)
+      CUDACHECKGOTO(cudaFreeAsync(m->cachedPreencodeTasks, stream), ret, fail);
+    if (m->cachedPreencodeDestinations)
+      CUDACHECKGOTO(cudaFreeAsync(m->cachedPreencodeDestinations, stream), ret, fail);
+    CUDACHECKGOTO(cudaMallocFromPoolAsync(&m->cachedPreencoded,
+        m->cachedStride * requiredBlocks, m->localPool, stream), ret, fail);
+    CUDACHECKGOTO(cudaMallocFromPoolAsync(
+        reinterpret_cast<void**>(&m->cachedPreencodeTasks),
+        sizeof(*m->cachedPreencodeTasks) * requiredBlocks,
+        m->localPool, stream), ret, fail);
+    CUDACHECKGOTO(cudaMallocFromPoolAsync(
+        reinterpret_cast<void**>(&m->cachedPreencodeDestinations),
+        sizeof(*m->cachedPreencodeDestinations) * requiredBlocks,
+        m->localPool, stream), ret, fail);
+    m->cachedPreencodeBlocks = requiredBlocks;
+  }
+
+  op->stride = m->cachedStride;
+  op->preencoded = m->cachedPreencoded;
+  op->preencodeTasks = m->cachedPreencodeTasks;
+  op->preencodeDestinations = m->cachedPreencodeDestinations;
+  for (int c = 0; c < activeRings; c++) {
+    op->rings[c].rx = m->rings[c].cachedRx;
+    op->rings[c].remoteRx = m->rings[c].cachedRemoteRx;
+  }
+fail:
+  return ret;
+}
+
 static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize) {
   ncclResult_t ret = ncclSuccess;
   cudaStream_t cs = nullptr;
-  cudaEvent_t setupDone = nullptr;
   cudaEvent_t prepareDone = nullptr;
   cudaEvent_t preencodeDone = nullptr;
-  cudaEvent_t cleanupDone = nullptr;
   RingLaunchState ringState[MAXCHANNELS];
   bool acquired = false;
+  bool resourcesRebuilt = false;
   ncclComm* comm = j->comm;
   ncclCompressedRsManager* m = op->manager;
   int ctasPerSegment = std::max(1, std::min<int>(MaxSliceCtas,
       static_cast<int>((capacity + TargetSliceBytes - 1) / TargetSliceBytes)));
-  if (op->stride > SIZE_MAX / NCCL_COMPRESSED_RX_DEPTH)
+  size_t requiredStride = op->stride;
+  if (requiredStride > SIZE_MAX / NCCL_COMPRESSED_RX_DEPTH)
     return ncclInvalidArgument;
-  size_t rxArenaBytes = op->stride * NCCL_COMPRESSED_RX_DEPTH;
   size_t nblocks = 1 + (j->recvcount - 1) / j->plan.blockElements;
   int activeRings = static_cast<int>(std::min<size_t>(nblocks,
       static_cast<size_t>(std::min(m->ringCount, activeRingLimit()))));
-  std::vector<cudaMemPoolPtrExportData> allRxData(
-      static_cast<size_t>(comm->nRanks) * activeRings);
   std::vector<int> destinations(nblocks);
   if (traceEnabled()) {
     std::fprintf(stderr,
         "compressed-rs rank=%d sequence=%llu phase=enqueue-config "
-        "rings=%d blocks=%zu eventWindow=%d rollingFinalCopy=1\n",
+        "rings=%d blocks=%zu eventWindow=%d earlySend=1 resourceCache=1\n",
         comm->rank, static_cast<unsigned long long>(op->sequence), activeRings,
         nblocks, NCCL_COMPRESSED_EVENT_GENERATIONS);
     std::fflush(stderr);
@@ -665,59 +732,42 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
   NCCLCHECKGOTO(ncclStrongStreamAcquire(ncclCudaGraphNone(comm->config.graphUsageMode),
       &comm->sharedRes->deviceStream, false, &cs), ret, fail);
   acquired = true;
-  CUDACHECKGOTO(cudaEventCreateWithFlags(&setupDone, cudaEventDisableTiming), ret, fail);
   CUDACHECKGOTO(cudaEventCreateWithFlags(&prepareDone, cudaEventDisableTiming), ret, fail);
   CUDACHECKGOTO(cudaEventCreateWithFlags(&preencodeDone, cudaEventDisableTiming), ret, fail);
-  CUDACHECKGOTO(cudaEventCreateWithFlags(&cleanupDone, cudaEventDisableTiming), ret, fail);
   for (int c = 0; c < activeRings; c++) {
     CUDACHECKGOTO(cudaEventCreateWithFlags(&ringState[c].finish, cudaEventDisableTiming), ret, fail);
   }
   {
     size_t preencodeBlocks = nblocks;
-    if (op->stride > SIZE_MAX / preencodeBlocks ||
+    if (requiredStride > SIZE_MAX / preencodeBlocks ||
         sizeof(*op->preencodeTasks) > SIZE_MAX / preencodeBlocks) {
       ret = ncclInvalidArgument;
       goto fail;
     }
-    size_t preencodeBytes = op->stride * preencodeBlocks;
     if (m->tailRecorded) NCCLCHECKGOTO(wait(cs, m->tail), ret, fail);
-    for (int c = 0; c < activeRings; c++) {
-      OperationRing& ringOp = op->rings[c];
-      CUDACHECKGOTO(cudaMallocFromPoolAsync(&ringOp.rx, rxArenaBytes, m->localPool, cs), ret, fail);
-      CUDACHECKGOTO(cudaMemsetAsync(ringOp.rx, 0, rxArenaBytes, cs), ret, fail);
-      CUDACHECKGOTO(cudaMemPoolExportPointer(
-          &allRxData[static_cast<size_t>(comm->rank) * activeRings + c], ringOp.rx), ret, fail);
+    NCCLCHECKGOTO(ensureCachedResources(op, activeRings, requiredStride,
+        preencodeBlocks, cs, &resourcesRebuilt), ret, fail);
+    if (traceEnabled()) {
+      std::fprintf(stderr,
+          "compressed-rs rank=%d sequence=%llu phase=resource-cache %s "
+          "rings=%d stride=%zu blocks=%zu\n",
+          comm->rank, static_cast<unsigned long long>(op->sequence),
+          resourcesRebuilt ? "rebuilt" : "reused", m->cachedRingCount,
+          m->cachedStride, m->cachedPreencodeBlocks);
+      std::fflush(stderr);
     }
-    CUDACHECKGOTO(cudaMallocFromPoolAsync(&op->preencoded, preencodeBytes,
-        m->localPool, cs), ret, fail);
-    CUDACHECKGOTO(cudaMallocFromPoolAsync(
-        reinterpret_cast<void**>(&op->preencodeTasks),
-        sizeof(*op->preencodeTasks) * preencodeBlocks, m->localPool, cs), ret, fail);
-    CUDACHECKGOTO(cudaMallocFromPoolAsync(reinterpret_cast<void**>(&op->preencodeDestinations),
-        sizeof(*op->preencodeDestinations) * nblocks, m->localPool, cs), ret, fail);
     for (size_t b = 0; b < nblocks; b++) {
       int c = static_cast<int>(b % activeRings);
       destinations[b] = comm->channels[c].ring.userRanks[comm->nRanks-1];
     }
     CUDACHECKGOTO(cudaMemcpyAsync(op->preencodeDestinations, destinations.data(),
         sizeof(*op->preencodeDestinations) * nblocks, cudaMemcpyHostToDevice, cs), ret, fail);
-    NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allRxData.data(),
-        sizeof(cudaMemPoolPtrExportData) * activeRings), ret, fail);
-    for (int c = 0; c < activeRings; c++) {
-      ncclCompressedRsRing& ring = m->rings[c];
-      OperationRing& ringOp = op->rings[c];
-      CUDACHECKGOTO(cudaMemPoolImportPointer(&ringOp.remoteRx, ring.nextPool,
-          &allRxData[static_cast<size_t>(ring.next) * activeRings + c]), ret, fail);
-    }
-    NCCLCHECKGOTO(record(setupDone, cs), ret, fail);
-    for (int c = 0; c < activeRings; c++) {
-      NCCLCHECKGOTO(wait(m->rings[c].sendStream, setupDone), ret, fail);
-    }
     for (int c = 0; c < activeRings; c++) {
       RingLaunchState& state = ringState[c];
+      ncclCompressedRsRing& ring = m->rings[c];
       state.blockCount = (nblocks + activeRings - 1 - c) / activeRings;
       for (int lane = 0; lane < NCCL_COMPRESSED_RX_DEPTH; lane++)
-        state.localCreditPending[lane] = true;
+        state.localCreditPending[lane] = !ring.localCreditInitialized[lane];
       state.batchCount = static_cast<int>(std::min<size_t>(
           NCCL_COMPRESSED_RX_DEPTH - 1, state.blockCount));
       for (int token = 0; token < state.batchCount; token++) {
@@ -771,6 +821,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
               &ring.localCanWritePhase[lane], cs, &submitted), ret, fail);
           if (submitted) {
             state.localCreditPending[lane] = false;
+            ring.localCreditInitialized[lane] = true;
             progressed = true;
           }
         }
@@ -812,8 +863,21 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
             NCCLCHECKGOTO(tryRecordIpcWindow(ring.nextDataReady[lane], ready,
                 &ring.nextDataReadyPhase[lane], ring.sendStream, &submitted), ret, fail);
             if (!submitted) { ret = ncclInternalError; goto fail; }
-            state.remoteLaneUsed[lane] = true;
             initialPending[token] = false;
+            // With two ranks the initial send is immediately followed by the
+            // final reduction. Once this send is submitted, the lane's next
+            // credit can only be produced by that final-copy, so the next
+            // cohort may already enqueue its wait/send DAG.
+            if (queue == 0 && comm->nRanks == 2 &&
+                state.nextBlockOrdinal < state.blockCount &&
+                state.nextBatchCount < NCCL_COMPRESSED_RX_DEPTH - 1) {
+              int nextToken = state.nextBatchCount++;
+              state.nextBlocks[nextToken] =
+                  c + state.nextBlockOrdinal * activeRings;
+              state.nextBaseLanes[nextToken] = lane;
+              state.nextInitialPending[nextToken] = true;
+              state.nextBlockOrdinal++;
+            }
             progressed = true;
           }
         }
@@ -895,7 +959,21 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
                 &ring.nextSync->rx[c][remoteLane].dataReady,
                 &ring.nextDataReadyPhase[remoteLane], j->stream, &submitted), ret, fail);
             if (!submitted) { ret = ncclInternalError; goto fail; }
-            state.remoteLaneUsed[remoteLane] = true;
+            // The last DRE writes the exact lane consumed by final-copy. Its
+            // next credit therefore belongs to final-copy, not to another DRE.
+            // Publish the following initial send now; the send stream waits on
+            // that credit and can start as soon as the peer releases the lane,
+            // while this rank is still running the rest of its final copies.
+            if (round + 2 == static_cast<uint32_t>(comm->nRanks - 1) &&
+                state.nextBlockOrdinal < state.blockCount &&
+                state.nextBatchCount < NCCL_COMPRESSED_RX_DEPTH - 1) {
+              int nextToken = state.nextBatchCount++;
+              state.nextBlocks[nextToken] =
+                  c + state.nextBlockOrdinal * activeRings;
+              state.nextBaseLanes[nextToken] = remoteLane;
+              state.nextInitialPending[nextToken] = true;
+              state.nextBlockOrdinal++;
+            }
             if (state.token > 0) {
               state.token--;
             } else {
@@ -904,17 +982,6 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
             }
           } else {
             state.completedBlocks++;
-            if (state.nextBlockOrdinal < state.blockCount) {
-              int nextToken = state.nextBatchCount++;
-              state.nextBlocks[nextToken] =
-                  c + state.nextBlockOrdinal * activeRings;
-              // The final local reduction releases this lane. Reusing it as
-              // the next block's base lets its initial Send overlap the
-              // remaining final-copy kernels in the current cohort.
-              state.nextBaseLanes[nextToken] = lane;
-              state.nextInitialPending[nextToken] = true;
-              state.nextBlockOrdinal++;
-            }
             if (state.token > 0) {
               state.token--;
             } else if (state.nextBatchCount > 0) {
@@ -948,9 +1015,9 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
         if (traceEnabled() && std::chrono::steady_clock::now() >= nextStallTrace) {
           std::fprintf(stderr,
               "compressed-rs rank=%d sequence=%llu phase=pipeline-stall "
-              "setup=%c preencode=%c\n",
+              "prepare=%c preencode=%c\n",
               comm->rank, static_cast<unsigned long long>(op->sequence),
-              traceEventState(setupDone), traceEventState(preencodeDone));
+              traceEventState(prepareDone), traceEventState(preencodeDone));
           for (int c = 0; c < activeRings; c++) {
             RingLaunchState& state = ringState[c];
             ncclCompressedRsRing& ring = m->rings[c];
@@ -1002,8 +1069,8 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
       }
     }
 
-    // Publish any partial acknowledgement batch before closing this
-    // operation. Ready/credit records were already published immediately;
+    // Publish any partial acknowledgement batch at the operation boundary.
+    // Ready/credit records were already published immediately;
     // these cumulative tails only release Event generations for later reuse.
     for (int c = 0; c < activeRings; c++) {
       ncclCompressedRsRing& ring = m->rings[c];
@@ -1017,110 +1084,13 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
       }
     }
 
-    // Consume the final credit for every remote RX lane before dropping the
-    // imported pointer. A separate IPC Event then closes pointer ownership.
-    auto nextCloseTrace = std::chrono::steady_clock::now() +
-        std::chrono::seconds(2);
-    unsigned closeSpins = 0;
-    for (;;) {
-      bool closed = true;
-      bool progressed = false;
-      for (int c = 0; c < activeRings; c++) {
-        ncclCompressedRsRing& ring = m->rings[c];
-        RingLaunchState& state = ringState[c];
-        bool creditsDone = true;
-        for (int lane = 0; lane < NCCL_COMPRESSED_RX_DEPTH; lane++) {
-          if (!state.remoteLaneUsed[lane] || state.finalCreditWaited[lane])
-            continue;
-          creditsDone = false;
-          bool submitted = false;
-          NCCLCHECKGOTO(tryWaitIpcWindow(ring.nextCanWrite[lane],
-              &ring.nextSync->rx[c][lane].canWrite,
-              &ring.nextCanWritePhase[lane], ring.sendStream, &submitted), ret, fail);
-          if (submitted) {
-            publishWindowWait(&ring.nextSync->rx[c][lane].canWrite,
-                ring.nextCanWritePhase[lane],
-                &ring.nextCanWriteWaitPublished[lane], true);
-            state.finalCreditWaited[lane] = true;
-            progressed = true;
-          }
-        }
-        if (!creditsDone) closed = false;
-        if (creditsDone && !state.remotePointerClosed) {
-          closed = false;
-          ncclCompressedRsEventSync* sync = &ring.nextSync->pointerClosed[c];
-          if (canRecordIpcPhase(sync, ring.nextPointerClosedPhase + 1)) {
-            CUDACHECKGOTO(cudaFreeAsync(op->rings[c].remoteRx, ring.sendStream), ret, fail);
-            op->rings[c].remoteRx = nullptr;
-            bool submitted = false;
-            NCCLCHECKGOTO(tryRecordIpcPhase(ring.nextPointerClosed, sync,
-                &ring.nextPointerClosedPhase, ring.sendStream, &submitted), ret, fail);
-            if (!submitted) { ret = ncclInternalError; goto fail; }
-            NCCLCHECKGOTO(record(state.finish, ring.sendStream), ret, fail);
-            state.remotePointerClosed = true;
-            progressed = true;
-          }
-        }
-        if (!state.localPointerClosed) {
-          closed = false;
-          bool submitted = false;
-          NCCLCHECKGOTO(tryWaitIpcPhase(ring.localPointerClosed,
-              &m->localSync->pointerClosed[c], &ring.localPointerClosedPhase,
-              cs, &submitted), ret, fail);
-          if (submitted) {
-            state.localPointerClosed = true;
-            progressed = true;
-          }
-        }
-      }
-      if (progressed) closeSpins = 0;
-      if (closed) break;
-      if (!progressed) {
-        if (traceEnabled() && std::chrono::steady_clock::now() >= nextCloseTrace) {
-          for (int c = 0; c < activeRings; c++) {
-            RingLaunchState& state = ringState[c];
-            ncclCompressedRsRing& ring = m->rings[c];
-            std::fprintf(stderr,
-                "compressed-rs rank=%d sequence=%llu phase=close-stall "
-                "ring=%d remoteClosed=%d localClosed=%d",
-                comm->rank, static_cast<unsigned long long>(op->sequence), c,
-                state.remotePointerClosed, state.localPointerClosed);
-            for (int lane = 0; lane < NCCL_COMPRESSED_RX_DEPTH; lane++) {
-              std::fprintf(stderr, " lane%d=%d/%d:%llu/%c(%c)", lane,
-                  state.remoteLaneUsed[lane], state.finalCreditWaited[lane],
-                  static_cast<unsigned long long>(ring.nextCanWritePhase[lane]),
-                  canWaitIpcWindow(&ring.nextSync->rx[c][lane].canWrite,
-                      ring.nextCanWritePhase[lane] + 1) ? 'R' : 'P',
-                  traceEventState(ring.nextCanWrite[lane][eventGeneration(
-                      ring.nextCanWritePhase[lane] + 1)]));
-            }
-            std::fputc('\n', stderr);
-          }
-          std::fflush(stderr);
-          nextCloseTrace = std::chrono::steady_clock::now() +
-              std::chrono::seconds(2);
-        }
-        if (comm->abortFlag != nullptr &&
-            __atomic_load_n(comm->abortFlag, __ATOMIC_ACQUIRE) != 0) {
-          ret = ncclSystemError;
-          goto fail;
-        }
-        progressPause(&closeSpins);
-      }
-    }
+    // Cached mappings remain valid across operations. The operation boundary
+    // only has to join the send streams into the user stream; final credits
+    // remain outstanding and become the initial credits of the next call.
     for (int c = 0; c < activeRings; c++) {
-      NCCLCHECKGOTO(wait(cs, ringState[c].finish), ret, fail);
-      CUDACHECKGOTO(cudaFreeAsync(op->rings[c].rx, cs), ret, fail);
-      op->rings[c].rx = nullptr;
+      NCCLCHECKGOTO(record(ringState[c].finish, m->rings[c].sendStream), ret, fail);
+      NCCLCHECKGOTO(wait(j->stream, ringState[c].finish), ret, fail);
     }
-    CUDACHECKGOTO(cudaFreeAsync(op->preencoded, cs), ret, fail);
-    CUDACHECKGOTO(cudaFreeAsync(op->preencodeTasks, cs), ret, fail);
-    CUDACHECKGOTO(cudaFreeAsync(op->preencodeDestinations, cs), ret, fail);
-    op->preencoded = nullptr;
-    op->preencodeTasks = nullptr;
-    op->preencodeDestinations = nullptr;
-    NCCLCHECKGOTO(record(cleanupDone, cs), ret, fail);
-    NCCLCHECKGOTO(wait(j->stream, cleanupDone), ret, fail);
     NCCLCHECKGOTO(record(m->tail, j->stream), ret, fail);
     m->tailRecorded = true;
   }
@@ -1130,10 +1100,8 @@ fail:
       &comm->sharedRes->deviceStream, false);
     if (ret == ncclSuccess) ret = x;
   }
-  if (setupDone) CUDACHECKIGNORE(cudaEventDestroy(setupDone));
   if (prepareDone) CUDACHECKIGNORE(cudaEventDestroy(prepareDone));
   if (preencodeDone) CUDACHECKIGNORE(cudaEventDestroy(preencodeDone));
-  if (cleanupDone) CUDACHECKIGNORE(cudaEventDestroy(cleanupDone));
   for (int c = 0; c < activeRings; c++) {
     if (ringState[c].finish) CUDACHECKIGNORE(cudaEventDestroy(ringState[c].finish));
   }
