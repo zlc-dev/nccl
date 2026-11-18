@@ -17,7 +17,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <deque>
 #include <mutex>
 #include <new>
 #include <thread>
@@ -123,11 +122,13 @@ struct Job {
 
 struct RingLaunchState {
   cudaEvent_t finish = nullptr;
-  std::deque<size_t> outbound;
   bool localCreditPending[NCCL_COMPRESSED_RX_DEPTH] = {};
   bool remoteLaneUsed[NCCL_COMPRESSED_RX_DEPTH] = {};
   bool finalCreditWaited[NCCL_COMPRESSED_RX_DEPTH] = {};
-  size_t currentBlock = 0;
+  size_t blocks[NCCL_COMPRESSED_RX_DEPTH - 1] = {};
+  bool initialPending[NCCL_COMPRESSED_RX_DEPTH - 1] = {};
+  int batchCount = 0;
+  int token = -1;
   uint32_t round = 0;
   size_t completedBlocks = 0;
   size_t blockCount = 0;
@@ -185,20 +186,6 @@ static void traceDestroy(const ncclComm* comm, const char* phase) {
 static ncclResult_t wait(cudaStream_t s, cudaEvent_t e) {
   CUDACHECK(cudaStreamWaitEvent(s, e, 0));
   return ncclSuccess;
-}
-
-static ncclResult_t queryComplete(cudaEvent_t event, bool* complete) {
-  cudaError_t status = CUDACLEARERROR(cudaEventQuery(event));
-  if (status == cudaSuccess) {
-    *complete = true;
-    return ncclSuccess;
-  }
-  if (status == cudaErrorNotReady) {
-    *complete = false;
-    return ncclSuccess;
-  }
-  CUDACHECK(status);
-  return ncclInternalError;
 }
 
 static char traceEventState(cudaEvent_t event) {
@@ -611,8 +598,13 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
       state.blockCount = (nblocks + activeRings - 1 - c) / activeRings;
       for (int lane = 0; lane < NCCL_COMPRESSED_RX_DEPTH; lane++)
         state.localCreditPending[lane] = true;
-      state.currentBlock = c;
-      state.outbound.push_back(c);
+      state.batchCount = static_cast<int>(std::min<size_t>(
+          NCCL_COMPRESSED_RX_DEPTH - 1, state.blockCount));
+      for (int token = 0; token < state.batchCount; token++) {
+        state.blocks[token] = c + static_cast<size_t>(token) * activeRings;
+        state.initialPending[token] = true;
+      }
+      state.token = state.batchCount - 1;
     }
     NCCLCHECKGOTO(ncclLaunchCompressedPrepareEncodeAll(op->preencodeTasks,
         op->preencoded, op->stride, j->sendbuff, j->recvcount,
@@ -638,7 +630,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
       bool progressed = false;
       for (int c = 0; c < activeRings; c++) {
         RingLaunchState& state = ringState[c];
-        if (state.completedBlocks != state.blockCount || !state.outbound.empty())
+        if (state.completedBlocks != state.blockCount)
           done = false;
       }
       if (done) break;
@@ -668,22 +660,19 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
         ncclCompressedRsRing& ring = m->rings[c];
         RingLaunchState& state = ringState[c];
         OperationRing& ringOp = op->rings[c];
-        if (!state.outbound.empty()) {
-          constexpr int lane = 0;
+        for (int token = state.batchCount - 1; token >= 0; token--) {
+          if (!state.initialPending[token]) continue;
+          int lane = token;
           ncclCompressedRsEventSync* credit = &ring.nextSync->rx[c][lane].canWrite;
           ncclCompressedRsEventSync* ready = &ring.nextSync->rx[c][lane].dataReady;
           if (!canWaitIpcPhase(credit, ring.nextCanWritePhase[lane] + 1) ||
               !canRecordIpcPhase(ready, ring.nextDataReadyPhase[lane] + 1))
             continue;
-          bool creditComplete = false;
-          NCCLCHECKGOTO(queryComplete(ring.nextCanWrite[lane],
-              &creditComplete), ret, fail);
-          if (!creditComplete) continue;
           bool submitted = false;
           NCCLCHECKGOTO(tryWaitIpcPhase(ring.nextCanWrite[lane], credit,
               &ring.nextCanWritePhase[lane], ring.sendStream, &submitted), ret, fail);
           if (!submitted) { ret = ncclInternalError; goto fail; }
-          size_t block = state.outbound.front();
+          size_t block = state.blocks[token];
           void* source = slot(op->preencoded, op->stride, block);
           NCCLCHECKGOTO(ncclLaunchCompressedSend(source,
               slot(ringOp.remoteRx, op->stride, lane), op->stride, capacity,
@@ -692,7 +681,7 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
               &ring.nextDataReadyPhase[lane], ring.sendStream, &submitted), ret, fail);
           if (!submitted) { ret = ncclInternalError; goto fail; }
           state.remoteLaneUsed[lane] = true;
-          state.outbound.pop_front();
+          state.initialPending[token] = false;
           progressed = true;
         }
       }
@@ -705,16 +694,18 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
         RingLaunchState& state = ringState[c];
         OperationRing& ringOp = op->rings[c];
         {
-          int lane = state.round % NCCL_COMPRESSED_RX_DEPTH;
+          if (state.token < 0) continue;
+          int token = state.token;
+          int lane = (token + state.round) % NCCL_COMPRESSED_RX_DEPTH;
           ncclCompressedRsEventSync* ready = &m->localSync->rx[c][lane].dataReady;
           ncclCompressedRsEventSync* credit = &m->localSync->rx[c][lane].canWrite;
           if (!canWaitIpcPhase(ready, ring.localDataReadyPhase[lane] + 1) ||
               !canRecordIpcPhase(credit, ring.localCanWritePhase[lane] + 1))
             continue;
-          size_t block = state.currentBlock;
+          size_t block = state.blocks[token];
           uint32_t round = state.round;
           bool final = round + 1 == static_cast<uint32_t>(comm->nRanks - 1);
-          int remoteLane = (round + 1) % NCCL_COMPRESSED_RX_DEPTH;
+          int remoteLane = (token + round + 1) % NCCL_COMPRESSED_RX_DEPTH;
           if (!final) {
             ncclCompressedRsRxSync* next = &ring.nextSync->rx[c][remoteLane];
             if (!canWaitIpcPhase(&next->canWrite,
@@ -722,10 +713,6 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
                 !canRecordIpcPhase(&next->dataReady,
                                    ring.nextDataReadyPhase[remoteLane] + 1))
               continue;
-            bool creditComplete = false;
-            NCCLCHECKGOTO(queryComplete(ring.nextCanWrite[remoteLane],
-                &creditComplete), ret, fail);
-            if (!creditComplete) continue;
           }
           bool submitted = false;
           NCCLCHECKGOTO(tryWaitIpcPhase(ring.localDataReady[lane], ready,
@@ -769,14 +756,29 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
                 &ring.nextDataReadyPhase[remoteLane], j->stream, &submitted), ret, fail);
             if (!submitted) { ret = ncclInternalError; goto fail; }
             state.remoteLaneUsed[remoteLane] = true;
-            state.round++;
+            if (state.token > 0) {
+              state.token--;
+            } else {
+              state.round++;
+              state.token = state.batchCount - 1;
+            }
           } else {
             state.completedBlocks++;
-            size_t nextBlock = state.currentBlock + activeRings;
-            if (nextBlock < nblocks) {
-              state.currentBlock = nextBlock;
+            if (state.token > 0) {
+              state.token--;
+            } else if (state.completedBlocks < state.blockCount) {
+              size_t remaining = state.blockCount - state.completedBlocks;
+              state.batchCount = static_cast<int>(std::min<size_t>(
+                  NCCL_COMPRESSED_RX_DEPTH - 1, remaining));
+              for (int nextToken = 0; nextToken < state.batchCount; nextToken++) {
+                size_t ordinal = state.completedBlocks + nextToken;
+                state.blocks[nextToken] = c + ordinal * activeRings;
+                state.initialPending[nextToken] = true;
+              }
               state.round = 0;
-              state.outbound.push_back(nextBlock);
+              state.token = state.batchCount - 1;
+            } else {
+              state.token = -1;
             }
           }
           progressed = true;
@@ -792,10 +794,14 @@ static ncclResult_t launch(Job* j, Operation* op, size_t capacity, int typeSize)
           for (int c = 0; c < activeRings; c++) {
             RingLaunchState& state = ringState[c];
             ncclCompressedRsRing& ring = m->rings[c];
+            int pending = 0;
+            for (int token = 0; token < state.batchCount; token++)
+              pending += state.initialPending[token] ? 1 : 0;
             std::fprintf(stderr,
-                "  ring=%d completed=%zu/%zu outbound=%zu block=%zu round=%u\n",
-                c, state.completedBlocks, state.blockCount,
-                state.outbound.size(), state.currentBlock, state.round);
+                "  ring=%d completed=%zu/%zu batch=%d token=%d round=%u "
+                "pending=%d\n",
+                c, state.completedBlocks, state.blockCount, state.batchCount,
+                state.token, state.round, pending);
             for (int lane = 0; lane < NCCL_COMPRESSED_RX_DEPTH; lane++) {
               ncclCompressedRsRxSync* local = &m->localSync->rx[c][lane];
               ncclCompressedRsRxSync* next = &ring.nextSync->rx[c][lane];

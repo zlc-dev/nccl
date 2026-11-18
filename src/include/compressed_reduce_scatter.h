@@ -11,7 +11,7 @@ struct ncclCompressedP2pSlot {
   ncclCompressedFrameHeader_t frame;
 };
 
-#define NCCL_COMPRESSED_RX_DEPTH 3
+#define NCCL_COMPRESSED_RX_DEPTH 8
 
 struct ncclComm;
 ncclResult_t ncclCompressedRsDestroy(struct ncclComm* comm);
