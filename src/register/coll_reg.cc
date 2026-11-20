@@ -67,6 +67,7 @@ ncclResult_t ncclRegisterCollNvlsBuffers(
 
   info->regBufType = NCCL_REGULAR_BUFFER;
   *regNeedConnect = true;
+  if (info->zipccl) goto exit;
   if (!(ncclParamLocalRegister() || (comm->planner.persistent && ncclParamGraphRegister()))) goto exit;
 #if CUDART_VERSION >= 11030
   if (info->algorithm == NCCL_ALGO_NVLS || info->algorithm == NCCL_ALGO_NVLS_TREE) {

@@ -104,6 +104,7 @@ static ncclResult_t fillCollTaskFromRaw(struct ncclComm* comm, struct ncclTaskTu
   }
   task->trafficBytes = task->count * elementSize * postTuningFuncTrafficPerByte(task->func, comm->nRanks);
   task->opHost = raw->opHost;
+  task->zipccl = raw->zipccl;
   task->opDev = raw->opDev;
   postTuningSetChunkSteps(task);
   task->launchCompletionEvent = ncclCollConfigGetLaunchCompletionEvent(&raw->collConfig);
@@ -651,6 +652,7 @@ static ncclResult_t postTuneLegacyEnqueueCollWork(
   devWork.recvbuffRmtAddrs = task->recvbuffRmtAddrs;
   devWork.root = task->root;
   devWork.nWarps = task->nWarps;
+  devWork.zipccl = task->zipccl;
   devWork.redOpArg = task->opDev.scalarArg;
   devWork.redOpArgIsPtr = task->opDev.scalarArgIsPtr;
   devWork.oneNode = (comm->nNodes == 1);
@@ -701,12 +703,16 @@ static ncclResult_t postTuneLegacyRecordAlgoNeedConnect(struct ncclComm* comm, i
 static ncclResult_t postTuneLegacyTasks(
   struct ncclComm* comm, struct ncclIntruQueue<struct ncclTaskTuningInfo, &ncclTaskTuningInfo::next>* legacyTaskQueue) {
   bool needConnect = false;
-  bool algoNeedConnect[NCCL_NUM_ALGORITHMS];
+  bool algoNeedConnect[ncclCollConnectSlots];
   struct ncclKernelPlanner* planner = &comm->planner;
 
   memset(algoNeedConnect, 0, sizeof(algoNeedConnect));
 
   for (struct ncclTaskTuningInfo* tInfo = ncclIntruQueueHead(legacyTaskQueue); tInfo != nullptr; tInfo = tInfo->next) {
+    if (tInfo->raw->coll.zipccl && !comm->zipRingConnected) {
+      algoNeedConnect[ncclZipRingConnectSlot] = true;
+      needConnect = true;
+    }
     if (tInfo->tuningOut.algo == NCCL_ALGO_NVLS || tInfo->tuningOut.algo == NCCL_ALGO_NVLS_TREE) {
       struct ncclTaskColl* task =
         ncclMemoryPoolAlloc<struct ncclTaskColl>(&comm->memPool_ncclTaskColl, &comm->memPermanent);
@@ -757,7 +763,7 @@ static ncclResult_t postTuneLegacyTasks(
 }
 
 static ncclResult_t postTuneAllGatherVEnsureRingConnected(struct ncclComm* comm) {
-  bool algoNeedConnect[NCCL_NUM_ALGORITHMS];
+  bool algoNeedConnect[ncclCollConnectSlots];
 
   if (!comm->runtimeConn || comm->initAlgoChannels[NCCL_ALGO_RING]) return ncclSuccess;
 

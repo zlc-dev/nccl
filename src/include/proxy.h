@@ -70,6 +70,7 @@ union ncclProxyOpSpecifics {
 };
 
 struct ncclProxyOp {
+  bool zipccl;
   struct ncclProxyConnection* connection;
   ssize_t nbytes;
   uint64_t opCount;

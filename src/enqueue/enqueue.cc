@@ -5,6 +5,8 @@
  * See LICENSE.txt for more license information
  *************************************************************************/
 
+#include "../../zipccl/frame.cuh"
+#include "zipccl_channels.h"
 #include "enqueue.h"
 #include "argcheck.h"
 #include "coll_net.h"
@@ -374,6 +376,7 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
     devWork.recvbuffRmtAddrs = task->recvbuffRmtAddrs;
     devWork.root = task->root;
     devWork.nWarps = task->nWarps;
+    devWork.zipccl = task->zipccl;
     devWork.redOpArg = task->opDev.scalarArg;
     devWork.redOpArgIsPtr = task->opDev.scalarArgIsPtr;
     devWork.oneNode = (comm->nNodes == 1);
@@ -569,6 +572,10 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     bool regNeedConnect = true;
     ncclRegisterCollNvlsBuffers(comm, task, regBufSend, regBufRecv, &planner->collCleanupQueue, &regNeedConnect);
 
+    if (task->zipccl && !comm->zipRingConnected) {
+      algoNeedConnect[ncclZipRingConnectSlot] = true;
+      *needConnect = true;
+    }
     if (comm->runtimeConn && comm->initAlgoChannels[task->algorithm] == false) {
       if (task->algorithm == NCCL_ALGO_NVLS_TREE && comm->initAlgoChannels[NCCL_ALGO_NVLS] == false &&
           regNeedConnect == true) {
@@ -592,6 +599,7 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
       devWork.recvbuffRmtAddrs = task->recvbuffRmtAddrs;
       devWork.root = task->root;
       devWork.nWarps = task->nWarps;
+      devWork.zipccl = task->zipccl;
       devWork.redOpArg = task->opDev.scalarArg;
       devWork.redOpArgIsPtr = task->opDev.scalarArgIsPtr;
       devWork.oneNode = (comm->nNodes == 1);
@@ -676,6 +684,11 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
       // We would have task->minCTAs=8 and task->maxCTAs=4.
       task->nMaxChannels = std::max<int>(task->nMaxChannels, task->minCTAs);
       task->nMaxChannels = std::min<int>(task->nMaxChannels, task->maxCTAs);
+      if (task->zipccl) {
+        int limit = std::min(comm->zipChannelCapacity, task->maxCTAs);
+        int target = ncclZipChannelCount(task->count, ncclZipRawSliceBytes / sizeof(uint16_t), comm->zipRingCount, limit);
+        task->nMaxChannels = std::min(limit, std::max(target, task->minCTAs));
+      }
       // nvlsCTAs has no comm default (UNDEF == no cap), so it is applied only when resolved to a value.
       if (task->isNvls && task->nvlsCTAs != NCCL_CONFIG_UNDEF_INT)
         task->nMaxChannels = std::min<int>(task->nMaxChannels, task->nvlsCTAs);
@@ -783,6 +796,18 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
       size_t countHi = cellsHi * elementsPerCell;
       (countHi != 0 ? countHi : countLo) -= cells * elementsPerCell - task->count;
 
+      if (task->zipccl) {
+        // ZipCCL is isolated in its own plan. Partition its rank-local result
+        // across exactly the selected connectors, including the final tail.
+        int channels = std::min<size_t>(task->count, int(task->nMaxChannels));
+        channelId = 0;
+        size_t count = task->count / channels;
+        if (count >= 8) count -= count % 8; // 16-byte BF16 tiles
+        nMidChannels = std::max(0, channels - 2);
+        countMid = nMidChannels ? count : 0;
+        countLo = channels == 1 ? task->count : count;
+        countHi = channels == 1 ? 0 : task->count - countLo - nMidChannels * count;
+      }
       nChannels = (countLo != 0 ? 1 : 0) + nMidChannels + (cellsHi != 0 ? 1 : 0);
 
       // Update number of channels propagated to the profiler
@@ -910,7 +935,7 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
 
     if (comm->rank == 0) {
       INFO(NCCL_TUNING, "%s: %ld Bytes -> Algo %s proto %s channel{Lo..Hi}={%d..%d} cgaClusterSize %d",
-           ncclFuncToString(task->func), task->count * ncclTypeSize(task->datatype), ncclAlgoToString(task->algorithm),
+           task->zipccl ? "ZipCCLReduceScatter" : ncclFuncToString(task->func), task->count * ncclTypeSize(task->datatype), ncclAlgoToString(task->algorithm),
            ncclProtoToString(task->protocol), devWork->channelLo, devWork->channelHi, plan->cgaClusterSize);
 
       if (task->isCollnet) {
@@ -2265,7 +2290,7 @@ static ncclResult_t calcCollChunking(struct ncclComm* comm, struct ncclTaskColl*
 
   int nstepsPerLoop, nchunksPerLoop;
   size_t loopOffset = 0;
-  int stepSize = comm->buffSizes[info->protocol] / NCCL_STEPS;
+  int stepSize = info->zipccl ? ncclZipStepBytes : comm->buffSizes[info->protocol] / NCCL_STEPS;
   int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
   int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
   int chunkSize = stepSize * chunkSteps;
@@ -2373,6 +2398,14 @@ static ncclResult_t calcCollChunking(struct ncclComm* comm, struct ncclTaskColl*
 
   // Compute nSteps for proxies
   chunkSize = chunkSize / grainSize * grainSize; // align chunkSize to multiple grainSize
+  if (info->zipccl) {
+    if (info->algorithm != NCCL_ALGO_RING || info->protocol != NCCL_PROTO_SIMPLE) return ncclInvalidUsage;
+    constexpr size_t elements = ncclZipRawSliceBytes / sizeof(uint16_t);
+    static_assert(sizeof(zipccl::device::RingFrameHeader) + zipccl::device::FrameLayout(elements).capacity <=
+                      ncclZipStepBytes * REDUCESCATTER_SLICESTEPS, "ZipCCL slice exceeds FIFO capacity");
+    chunkSize = std::min(chunkSize, ncclZipRawSliceBytes * (chunkSteps / sliceSteps));
+    if (chunkSize < grainSize) return ncclInvalidUsage;
+  }
   switch (pattern) {
   case ncclPatternTreeUp:
   case ncclPatternTreeDown:
@@ -2425,6 +2458,7 @@ static ncclResult_t calcCollChunking(struct ncclComm* comm, struct ncclTaskColl*
   proxyOp->protocol = info->protocol;
   proxyOp->dtype = info->datatype;
   proxyOp->algorithm = info->algorithm;
+  proxyOp->zipccl = info->zipccl;
   if (info->opDev.op == ncclDevPreMulSum || info->opDev.op == ncclDevSumPostDiv) {
     proxyOp->redOp = ncclSum; // Network sees avg as sum
   } else {
@@ -2811,6 +2845,7 @@ static ncclResult_t collTaskAppend(struct ncclComm* comm, struct ncclInfo* info,
       elementSize = 1;
     }
     t->trafficBytes = t->count * elementSize * ncclFuncTrafficPerByte(t->func, comm->nRanks);
+    t->zipccl = info->zipccl;
     t->opHost = info->op;
     t->opDev = opDev; // C++ struct assignment
     t->chunkSteps = info->chunkSteps;
@@ -3299,6 +3334,7 @@ static ncclResult_t rawTaskAppend(struct ncclComm* comm, struct ncclInfo* info) 
     t->coll.root = info->root;
     t->coll.datatype = info->datatype;
     t->coll.opHost = info->op;
+    t->coll.zipccl = info->zipccl;
     t->coll.opDev = opDev;
     t->coll.stream = info->stream;
     t->coll.collConfig = info->collConfig;
@@ -3395,7 +3431,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       int perCall = info->collConfig.CTAPolicy;
       bool envOverridden = ncclGetEnvCtaPolicy() != NCCL_CONFIG_UNDEF_INT;
       info->collConfig.CTAPolicy = ncclCollConfigResolveCTAPolicy(perCall, comm->config.CTAPolicy, envOverridden);
-      if ((info->collConfig.CTAPolicy & NCCL_CTA_POLICY_ZERO) && (ceAvailable || hierCeAvailable)) {
+      if (!info->zipccl && (info->collConfig.CTAPolicy & NCCL_CTA_POLICY_ZERO) && (ceAvailable || hierCeAvailable)) {
         NCCLCHECK(ceCollTaskAppend(comm, info, sendWin, recvWin, opDev));
       }
       // Append kernel-based collective

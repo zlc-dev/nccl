@@ -8,6 +8,7 @@
 #include "enqueue.h"
 #include "ce_coll.h"
 #include "checks.h"
+#include "config/collconfig.h"
 #include "debug.h"
 #include "dev_runtime.h"
 #include "enqueue/task_pretuning.h"
@@ -35,6 +36,7 @@ static ncclResult_t fillCollTuningInput(struct ncclComm* comm, struct ncclRawTas
   in->comm = comm;
   // disable ce temporarily
   in->tuningMask = NCCL_TUNING_MASK_SYM_KERNELS | NCCL_TUNING_MASK_GENERAL_KERNELS;
+  if (raw->zipccl) NCCLCHECK(ncclCollConfigGetAlgMask(&raw->collConfig, raw->func, &in->tuningMask));
   in->func = raw->func;
   in->redOp = raw->opHost;
   in->devRedOp = raw->opDev.op;

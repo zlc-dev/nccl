@@ -304,6 +304,17 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
   }
 
 public:
+  // Codec callbacks run on the worker subset used by process(). These helpers
+  // expose that subset's synchronization without exposing the connection state
+  // machine itself.
+  __device__ __forceinline__ void syncCodecWorkers() {
+    subBarrier();
+  }
+  __device__ __forceinline__ void* codecScratch() {
+    // The codec is collective over all process() workers, so every worker must
+    // address the same scratch slot rather than its own warp's slot.
+    return ncclScratchForWarp(0);
+  }
   static inline __device__ void sendPeerNotify(int peer, int connIndex, int steps) {
     ncclDevChannelPeer* peerPtr = ncclShmem.channel.peers[peer];
     peerPtr->send[connIndex].step += steps;
@@ -616,7 +627,7 @@ public:
                         uint8_t connIndexSend = 0, struct ncclDevWorkColl* collWork = nullptr,
                         struct ncclDevWorkP2p* p2pWork = nullptr, int stepSize_ = 0, int mode = primsModeDefault)
     : tid(tid), nthreads(nthreads), tidInBlock(threadIdx.x), group(group),
-      stepSize(stepSize_ == 0 ? ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS / sizeof(T) : stepSize_) {
+      stepSize(connIndexSend == NCCL_CONN_ZIPCCL ? ncclZipStepBytes / sizeof(T) : stepSize_ == 0 ? ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS / sizeof(T) : stepSize_) {
     int peer = -1;
     flags = 0;
     index = -1;

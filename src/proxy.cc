@@ -598,20 +598,20 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
   case ncclPatternPipelineFrom:
   case ncclPatternPipelineTo:
     {
-      struct ncclRing* ring = &channel->ring;
+      struct ncclRing* ring = op->zipccl ? &comm->channels[comm->zipSourceChannel(op->channelId)].ring : &channel->ring;
       needProxy = NeedProxy(proxyRecv, op->pattern, op->root, ring, comm->nRanks);
       if (op->coll == ncclFuncAllGatherV && op->pattern == ncclPatternRing) {
         op->nsteps = op->specifics.bcast.recvSlices;
         if (op->nsteps == 0) needProxy = false;
       }
-      if (needProxy) NCCLCHECK(SaveProxy(comm, channel, proxyRecv, ring->prev, op, 0, justInquire));
+      if (needProxy) NCCLCHECK(SaveProxy(comm, channel, proxyRecv, ring->prev, op, op->zipccl ? NCCL_CONN_ZIPCCL : 0, justInquire));
 
       needProxy = NeedProxy(proxySend, op->pattern, op->root, ring, comm->nRanks);
       if (op->coll == ncclFuncAllGatherV && op->pattern == ncclPatternRing) {
         op->nsteps = op->specifics.bcast.sendSlices;
         if (op->nsteps == 0) needProxy = false;
       }
-      if (needProxy) NCCLCHECK(SaveProxy(comm, channel, proxySend, ring->next, op, 0, justInquire));
+      if (needProxy) NCCLCHECK(SaveProxy(comm, channel, proxySend, ring->next, op, op->zipccl ? NCCL_CONN_ZIPCCL : 0, justInquire));
     }
     break;
   case ncclPatternTreeUp:

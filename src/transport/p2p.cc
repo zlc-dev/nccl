@@ -65,6 +65,7 @@ struct p2pShmProxyInfo {
   // Intermediate step for sender
   struct ncclRecvMem* ceRecvMem;
   char* ceDevBuff;
+  int stepBytes;
 
   // Receiver buffer
   char* recvFifo;
@@ -410,7 +411,7 @@ ncclResult_t p2pSendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
 
   int sendSize = sizeof(struct ncclSendMem);
   // For P2P Read the SIMPLE buffer is tagged on the end of the ncclSendMem structure
-  if (info->read) sendSize += comm->buffSizes[NCCL_PROTO_SIMPLE];
+  if (info->read) sendSize += ncclConnBuffSize(connIndex, NCCL_PROTO_SIMPLE, comm->buffSizes[NCCL_PROTO_SIMPLE]);
   ALIGN_SIZE(sendSize, CUDA_IPC_MIN);
 
   if (intermediateRank == -1) {
@@ -456,7 +457,7 @@ ncclResult_t p2pSendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
   }
   NCCLCHECK(ncclProxyConnect(comm, TRANSPORT_P2P, 1, info->rank, &send->proxyConn));
   if (useMemcpy) {
-    NCCLCHECK(ncclProxyCallBlocking(comm, &send->proxyConn, ncclProxyMsgSetup, NULL, 0, &resources->proxyInfo,
+    NCCLCHECK(ncclProxyCallBlocking(comm, &send->proxyConn, ncclProxyMsgSetup, &connIndex, sizeof(connIndex), &resources->proxyInfo,
                                     sizeof(struct p2pShmProxyInfo)));
     memcpy(&info->desc, &resources->proxyInfo.desc, sizeof(ncclShmIpcDesc_t));
   } else {
@@ -490,7 +491,7 @@ ncclResult_t p2pRecvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
   int recvSize = sizeof(struct ncclRecvMem);
   // For P2P Read the SIMPLE buffer is tagged on the end of the ncclSendMem structure
   for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
-    if (!(info->read && p == NCCL_PROTO_SIMPLE)) recvSize += comm->buffSizes[p];
+    if (!(info->read && p == NCCL_PROTO_SIMPLE)) recvSize += ncclConnBuffSize(connIndex, p, comm->buffSizes[p]);
   }
   ALIGN_SIZE(recvSize, CUDA_IPC_MIN);
 
@@ -555,10 +556,10 @@ static ncclResult_t p2pSendConnect(struct ncclComm* comm, struct ncclConnect* co
       send->conn.buffs[p] = (char*)(resources->sendDevMem + 1);
     } else {
       send->conn.buffs[p] = buff;
-      buff += comm->buffSizes[p];
+      buff += ncclConnBuffSize(send->connIndex, p, comm->buffSizes[p]);
     }
   }
-  send->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS;
+  send->conn.stepSize = ncclConnBuffSize(send->connIndex, NCCL_PROTO_SIMPLE, comm->buffSizes[NCCL_PROTO_SIMPLE]) / NCCL_STEPS;
 
   if (useMemcpy) {
     send->conn.tail = &resources->proxyInfo.ceRecvMem->tail;
@@ -605,7 +606,7 @@ ncclResult_t p2pRecvConnect(struct ncclComm* comm, struct ncclConnect* connectIn
     recv->conn.ptrExchange = &remDevMem->ptrExchange;
     recv->conn.redOpArgExchange = remDevMem->redOpArgExchange;
   }
-  recv->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS;
+  recv->conn.stepSize = ncclConnBuffSize(recv->connIndex, NCCL_PROTO_SIMPLE, comm->buffSizes[NCCL_PROTO_SIMPLE]) / NCCL_STEPS;
 
   char* buff = (char*)(resources->recvDevMem + 1);
   for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
@@ -615,7 +616,7 @@ ncclResult_t p2pRecvConnect(struct ncclComm* comm, struct ncclConnect* connectIn
       recv->conn.buffs[p] = (char*)(remDevMem + 1);
     } else {
       recv->conn.buffs[p] = buff;
-      buff += comm->buffSizes[p];
+      buff += ncclConnBuffSize(recv->connIndex, p, comm->buffSizes[p]);
     }
   }
   return ncclSuccess;
@@ -693,7 +694,10 @@ static ncclResult_t p2pSendProxySetup(struct ncclProxyConnection* connection, st
     NCCLCHECK(ncclCalloc(&proxyInfo, 1));
     connection->transportResources = proxyInfo;
 
-    NCCLCHECK(ncclCudaCalloc(&proxyInfo->ceDevBuff, proxyState->buffSizes[NCCL_PROTO_SIMPLE], proxyState->memManager));
+    if (reqSize != sizeof(int)) return ncclInternalError;
+    int bytes = ncclConnBuffSize(*static_cast<int*>(reqBuff), NCCL_PROTO_SIMPLE, proxyState->buffSizes[NCCL_PROTO_SIMPLE]);
+    proxyInfo->stepBytes = bytes / NCCL_STEPS;
+    NCCLCHECK(ncclCudaCalloc(&proxyInfo->ceDevBuff, bytes, proxyState->memManager));
 
     // Create a SHM segment for the peer to attach to
     shmSize = sizeof(struct ncclSendMem) + sizeof(struct ncclRecvMem);
@@ -855,10 +859,10 @@ static ncclResult_t p2pSendProxyProgress(struct ncclProxyState* proxyState, stru
   args->idle = 1;
   if (args->state == ncclProxyOpProgress) {
     int p = args->protocol;
-    int stepSize = proxyState->buffSizes[p] / NCCL_STEPS;
     for (int s = 0; s < args->nsubs; s++) {
       struct ncclProxySubArgs* sub = args->subs + s;
       struct p2pShmProxyInfo* resources = (struct p2pShmProxyInfo*)(sub->connection->transportResources);
+      int stepSize = resources->stepBytes;
       if (p != NCCL_PROTO_SIMPLE) {
         // Only Simple uses cudaMemcpy
         resources->step = sub->base + sub->nsteps;

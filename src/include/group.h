@@ -43,6 +43,8 @@ struct ncclGroupJob {
   struct ncclIntruQueue<struct ncclAsyncJob, &ncclAsyncJob::next> asyncJobs;
 };
 
+constexpr int ncclZipRingConnectSlot = NCCL_NUM_ALGORITHMS;
+constexpr int ncclCollConnectSlots = NCCL_NUM_ALGORITHMS + 1;
 ncclResult_t ncclCollPreconnect(struct ncclComm* comm, bool* algoNeedConnect);
 
 ncclResult_t doLaunches(struct ncclComm* head, int taskType = ncclGroupTaskTypeCollective);

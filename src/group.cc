@@ -276,19 +276,30 @@ ncclResult_t ncclCollPreconnect(struct ncclComm* comm, bool* algoNeedConnect) {
       }
     }
   }
+  if (algoNeedConnect[ncclZipRingConnectSlot] && !comm->zipRingConnected) {
+    for (int c = 0; c < comm->zipChannelCapacity; ++c) {
+      int source = comm->zipSourceChannel(c);
+      ncclRing* ring = &comm->channels[source].ring;
+      if (comm->rank == 0)
+        INFO(NCCL_GRAPH, "ZipCCL channel %d uses ring from topology channel %d", c, source);
+      NCCLCHECK(ncclTransportP2pConnect(comm, c, 1, &ring->prev, 1, &ring->next, NCCL_CONN_ZIPCCL));
+    }
+    NCCLCHECK(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_RING], NCCL_CONN_ZIPCCL));
+    comm->zipRingConnected = true;
+  }
   return ncclSuccess;
 }
 
 ncclResult_t ncclPrepareTasksAndCollPreconnectFunc(struct ncclAsyncJob* job_) {
   struct ncclPrepareTasksAndCollPreconnectJob* job = (ncclPrepareTasksAndCollPreconnectJob*)job_;
   struct ncclComm* comm = job->comm;
-  bool needConnect;
-  bool algoNeedConnect[NCCL_NUM_ALGORITHMS];
-  memset(algoNeedConnect, 0, sizeof(bool) * NCCL_NUM_ALGORITHMS);
+  bool needConnect = false;
+  bool algoNeedConnect[ncclCollConnectSlots];
+  memset(algoNeedConnect, 0, sizeof(bool) * ncclCollConnectSlots);
   CUDACHECK(cudaSetDevice(comm->cudaDev));
   if (!job_->isThreadMain && ncclOsCpuCount(comm->cpuAffinity)) ncclOsSetAffinity(comm->cpuAffinity);
   NCCLCHECK(ncclPrepareTasks(comm, algoNeedConnect, &needConnect, job->simInfo));
-  if (comm->cuMemSupport && needConnect) NCCLCHECK(ncclCollPreconnect(comm, algoNeedConnect));
+  if ((comm->cuMemSupport && needConnect) || algoNeedConnect[ncclZipRingConnectSlot]) NCCLCHECK(ncclCollPreconnect(comm, algoNeedConnect));
   return ncclSuccess;
 }
 
@@ -718,13 +729,13 @@ static ncclResult_t ncclPrepareTasksAndCollPreconnect(
     ncclIntruQueueEnqueue(asyncCollJobs, &job->base);
   } else {
     bool needConnect = false;
-    bool algoNeedConnect[NCCL_NUM_ALGORITHMS];
-    memset(algoNeedConnect, 0, sizeof(bool) * NCCL_NUM_ALGORITHMS);
+    bool algoNeedConnect[ncclCollConnectSlots];
+    memset(algoNeedConnect, 0, sizeof(bool) * ncclCollConnectSlots);
 
     CUDACHECK(cudaSetDevice(comm->cudaDev));
     NCCLCHECK(ncclPrepareTasks(comm, algoNeedConnect, &needConnect, simInfo));
 
-    if (comm->cuMemSupport && needConnect) {
+    if ((comm->cuMemSupport && needConnect) || algoNeedConnect[ncclZipRingConnectSlot]) {
       ncclResult_t ret;
       struct ncclPreconnectJob* job;
       NEW_NOTHROW(job, ncclPreconnectJob);
@@ -734,11 +745,11 @@ static ncclResult_t ncclPrepareTasksAndCollPreconnect(
       job->base.abortFlag = comm->abortFlag;
       job->base.abortFlagDev = comm->abortFlagDev;
       job->comm = comm;
-      if ((ret = ncclCalloc(&job->algoNeedConnect, NCCL_NUM_ALGORITHMS))) {
+      if ((ret = ncclCalloc(&job->algoNeedConnect, ncclCollConnectSlots))) {
         delete job;
         NCCLCHECK(ret);
       }
-      memcpy(job->algoNeedConnect, algoNeedConnect, sizeof(bool) * NCCL_NUM_ALGORITHMS);
+      memcpy(job->algoNeedConnect, algoNeedConnect, sizeof(bool) * ncclCollConnectSlots);
       ncclIntruQueueEnqueue(asyncCollJobs, &job->base);
     }
   }

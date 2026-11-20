@@ -166,6 +166,7 @@ struct ncclProxyConnector {
 };
 
 struct ncclConnector {
+  int connIndex;
   int connected;
   int hasSeen;
   int p2pOnly;
@@ -231,7 +232,15 @@ struct ncclNvls {
 #define NCCL_MAX_ARITY NCCL_MAX_DIRECT_ARITY
 #endif
 
-#define NCCL_MAX_CONNS 2
+#define NCCL_CONN_ZIPCCL 2
+#define NCCL_MAX_CONNS 3
+constexpr int ncclZipRawSliceBytes = 1 << 20;
+constexpr int ncclZipStepBytes = 640 << 10;
+
+inline int ncclConnBuffSize(int connIndex, int protocol, int normalSize) {
+  if (connIndex != NCCL_CONN_ZIPCCL) return normalSize;
+  return protocol == NCCL_PROTO_SIMPLE ? NCCL_STEPS * ncclZipStepBytes : 0;
+}
 struct ncclChannelPeer {
   struct ncclConnector send[NCCL_MAX_CONNS];
   struct ncclConnector recv[NCCL_MAX_CONNS];
@@ -289,7 +298,7 @@ struct alignas(16) ncclDevWorkColl {
   //   nChannels == (channelHi - channelLo) + 1
   uint32_t channelLo:8, channelHi:8;
   uint32_t nWarps:8;
-  uint32_t redOpArgIsPtr:1, regUsed:1, netRegUsed:1, oneNode:1, direct:2, isOneRPN:1;
+  uint32_t redOpArgIsPtr:1, regUsed:1, netRegUsed:1, oneNode:1, direct:2, isOneRPN:1, zipccl:1;
   uint32_t profilerEnabled:1;
   uint32_t root;
   void* recvbuff;
@@ -428,6 +437,7 @@ struct ncclDevChannelPeer {
 };
 
 struct alignas(16) ncclDevChannel {
+  int zipSourceChannel;
   struct ncclDevChannelPeer** peers;
   struct ncclRing ring;
   struct ncclTree tree;

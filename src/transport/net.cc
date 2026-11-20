@@ -306,7 +306,8 @@ static ncclResult_t sendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
 
   int proxyRank;
   int64_t netId;
-  NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, peerInfo->rank, &netId, &req.netDev, &proxyRank));
+  int topologyChannel = connIndex == NCCL_CONN_ZIPCCL ? comm->zipSourceChannel(channelId) : channelId;
+  NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, topologyChannel, peerInfo->rank, &netId, &req.netDev, &proxyRank));
   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->rank, netId, 1, &req.useGdr));
   send->conn.flags |= req.useGdr ? NCCL_DIRECT_NIC : 0;
   if (!req.useGdr && connIndex == 0) comm->useGdr = 0;
@@ -367,7 +368,8 @@ static ncclResult_t recvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
   // Use myInfo->rank for peerRank as receiver uses its own netdev
   int proxyRank;
   int64_t netId;
-  NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, /*peerRank=*/myInfo->rank, &netId, &req.netDev,
+  int topologyChannel = connIndex == NCCL_CONN_ZIPCCL ? comm->zipSourceChannel(channelId) : channelId;
+  NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, topologyChannel, /*peerRank=*/myInfo->rank, &netId, &req.netDev,
                               &proxyRank));
   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->rank, netId, 0, &req.useGdr));
   recv->conn.flags |= req.useGdr ? NCCL_DIRECT_NIC : 0;
@@ -527,7 +529,7 @@ static ncclResult_t sendConnect(struct ncclComm* comm, struct ncclConnect* conne
 
   struct ncclRecvMem* recvMem = (struct ncclRecvMem*)NCCL_NET_MAP_GET_POINTER(map, gpu, recvMem);
   send->conn.tail = &recvMem->tail;
-  send->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS;
+  send->conn.stepSize = ncclConnBuffSize(send->connIndex, NCCL_PROTO_SIMPLE, comm->buffSizes[NCCL_PROTO_SIMPLE]) / NCCL_STEPS;
   send->conn.connFifo = recvMem->connFifo;
   // Only fuse P2P buffers, continue to allocate dedicated buffers for ring/tree
   for (int i = 0; i < NCCL_STEPS; i++) {
@@ -605,7 +607,7 @@ static ncclResult_t recvConnect(struct ncclComm* comm, struct ncclConnect* conne
   struct ncclRecvMem* recvMem = (struct ncclRecvMem*)NCCL_NET_MAP_GET_POINTER(map, gpu, recvMem);
   void* gdcMem = map->mems[NCCL_NET_MAP_GDCMEM].gpuPtr;
   recv->conn.tail = gdcMem ? (uint64_t*)gdcMem : &recvMem->tail;
-  recv->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS;
+  recv->conn.stepSize = ncclConnBuffSize(recv->connIndex, NCCL_PROTO_SIMPLE, comm->buffSizes[NCCL_PROTO_SIMPLE]) / NCCL_STEPS;
   recv->conn.connFifo = recvMem->connFifo;
   // Only fuse P2P buffers, continue to allocate dedicated buffers for ring/tree
   for (int i = 0; i < NCCL_STEPS; i++) {
@@ -933,9 +935,10 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
   if (resources->shared == 0) {
     // Only allocate dedicated buffers for ring/tree, not for p2p
     for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
-      NCCL_NET_MAP_ADD_POINTER(map, 0, p != NCCL_PROTO_LL && resources->useGdr ? 1 : 0, proxyState->buffSizes[p],
-                               buffs[p]);
-      resources->buffSizes[p] = proxyState->buffSizes[p];
+      resources->buffSizes[p] = ncclConnBuffSize(resources->connIndex, p, proxyState->buffSizes[p]);
+      if (resources->buffSizes[p]) {
+        NCCL_NET_MAP_ADD_POINTER(map, 0, p != NCCL_PROTO_LL && resources->useGdr ? 1 : 0, resources->buffSizes[p], buffs[p]);
+      }
     }
   } else {
     // Get shared buffers
@@ -1118,8 +1121,10 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
   if (resources->shared == 0) {
     // Only allocate dedicated buffers for ring/tree, not for p2p
     for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
-      NCCL_NET_MAP_ADD_POINTER(map, 0, resources->useGdr ? 1 : 0, proxyState->buffSizes[p], buffs[p]);
-      resources->buffSizes[p] = proxyState->buffSizes[p];
+      resources->buffSizes[p] = ncclConnBuffSize(resources->connIndex, p, proxyState->buffSizes[p]);
+      if (resources->buffSizes[p]) {
+        NCCL_NET_MAP_ADD_POINTER(map, 0, resources->useGdr ? 1 : 0, resources->buffSizes[p], buffs[p]);
+      }
     }
   } else {
     // Get shared buffers

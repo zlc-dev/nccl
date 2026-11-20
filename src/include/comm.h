@@ -211,6 +211,7 @@ struct ncclCollnetHandleList {
 
 struct ncclTaskColl {
   struct ncclTaskColl* next;
+  bool zipccl;
   ncclFunc_t func;
   void const* sendbuff;
   void* recvbuff;
@@ -616,6 +617,11 @@ struct ncclComm {
   uint64_t* connectRecv;
   struct ncclTopoGraph graphs[NCCL_NUM_ALGORITHMS];
   int maxTreePattern;
+  bool zipRingConnected;
+  int zipRingCount;
+  int zipChannelCapacity;
+  int zipRingSources[MAXCHANNELS]; // representative channel for each directed cycle
+  int zipSourceChannel(int c) const { return zipRingSources[c % zipRingCount]; }
   bool initAlgoChannels[NCCL_NUM_ALGORITHMS];
   bool runtimeConn; // if dynamic connection is supported
   bool directMode; // if any process manages more than one local rank

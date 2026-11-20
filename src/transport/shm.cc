@@ -99,7 +99,7 @@ static ncclResult_t shmSendSetup(struct ncclComm* comm, struct ncclTopoGraph* gr
   send->transportResources = resources;
 
   if (shmLocality == SHM_SEND_SIDE) {
-    for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) shmSize += comm->buffSizes[p];
+    for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) shmSize += ncclConnBuffSize(connIndex, p, comm->buffSizes[p]);
   }
   req.size = shmSize;
   if (myInfo->hostHash == peerInfo->hostHash && myInfo->pidHash == peerInfo->pidHash) req.legacy = true;
@@ -132,7 +132,7 @@ static ncclResult_t shmRecvSetup(struct ncclComm* comm, struct ncclTopoGraph* gr
   static_assert(sizeof(struct shmConnectInfo) <= sizeof(struct ncclConnect), "shm Connect Info is too big");
 
   if (shmLocality == SHM_RECV_SIDE) {
-    for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) shmSize += comm->buffSizes[p];
+    for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) shmSize += ncclConnBuffSize(connIndex, p, comm->buffSizes[p]);
   }
   req.size = shmSize;
   if (myInfo->hostHash == peerInfo->hostHash && myInfo->pidHash == peerInfo->pidHash) req.legacy = true;
@@ -163,11 +163,11 @@ static ncclResult_t shmSendConnect(struct ncclComm* comm, struct ncclConnect* co
   buff = shmLocality == SHM_SEND_SIDE ? (char*)(resources->devHostMem + 1) : (char*)(resources->devRemHostMem + 1);
   for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
     send->conn.buffs[p] = buff;
-    buff += comm->buffSizes[p];
+    buff += ncclConnBuffSize(send->connIndex, p, comm->buffSizes[p]);
   }
   send->conn.tail = &resources->devRemHostMem->tail;
   send->conn.head = &resources->devHostMem->head;
-  send->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS;
+  send->conn.stepSize = ncclConnBuffSize(send->connIndex, NCCL_PROTO_SIMPLE, comm->buffSizes[NCCL_PROTO_SIMPLE]) / NCCL_STEPS;
 
   // We must assign the proxyConn's proxyProgress property for proper checking at enqueue-time
   send->proxyConn.proxyProgress = shmTransport.send.proxyProgress;
@@ -188,11 +188,11 @@ static ncclResult_t shmRecvConnect(struct ncclComm* comm, struct ncclConnect* co
   buff = shmLocality == SHM_RECV_SIDE ? (char*)(resources->devHostMem + 1) : (char*)(resources->devRemHostMem + 1);
   for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
     recv->conn.buffs[p] = buff;
-    buff += comm->buffSizes[p];
+    buff += ncclConnBuffSize(recv->connIndex, p, comm->buffSizes[p]);
   }
   recv->conn.head = &resources->devRemHostMem->head;
   recv->conn.tail = &resources->devHostMem->tail;
-  recv->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS;
+  recv->conn.stepSize = ncclConnBuffSize(recv->connIndex, NCCL_PROTO_SIMPLE, comm->buffSizes[NCCL_PROTO_SIMPLE]) / NCCL_STEPS;
 
   // We must assign the proxyConn's proxyProgress property for proper checking at enqueue-time
   recv->proxyConn.proxyProgress = shmTransport.recv.proxyProgress;

@@ -25,6 +25,7 @@ enum ncclTaskKind {
 
 // Collective API inputs captured at enqueue time.
 struct ncclRawTaskColl {
+  bool zipccl;
   ncclFunc_t func;
   void const* sendbuff;
   void* recvbuff;

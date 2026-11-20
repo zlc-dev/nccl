@@ -338,6 +338,21 @@ ncclResult_t ncclReduceScatter(const void* sendbuff, void* recvbuff, size_t recv
   return ncclReduceScatterConfigImpl(sendbuff, recvbuff, recvcount, datatype, op, comm, stream, nullptr);
 }
 
+NCCL_API(ncclResult_t, ncclZipCCLReduceScatter, const void* sendbuff, void* recvbuff, size_t recvcount,
+         ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
+ncclResult_t ncclZipCCLReduceScatter(const void* sendbuff, void* recvbuff, size_t recvcount, ncclDataType_t datatype,
+                                     ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
+  if (datatype != ncclBfloat16 || op != ncclSum) return ncclInvalidArgument;
+  ncclInfo info = {ncclFuncReduceScatter, "ZipCCLReduceScatter", sendbuff, recvbuff, recvcount, datatype, op,
+                   0, comm, stream, REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS};
+  ncclCollConfig_t config = NCCL_COLLCONFIG_INITIALIZER;
+  config.algSelection = "RING_SIMPLE";
+  config.forceAlgSelection = 1;
+  NCCLCHECK(ncclParseCollConfig(&config, &info.collConfig));
+  info.zipccl = true;
+  return ncclEnqueueCheck(&info);
+}
+
 NCCL_API(ncclResult_t, ncclReduceScatterConfig, const void* sendbuff, void* recvbuff, size_t recvcount,
          ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream, const ncclCollConfig_t* config);
 ncclResult_t ncclReduceScatterConfig(const void* sendbuff, void* recvbuff, size_t recvcount, ncclDataType_t datatype,
