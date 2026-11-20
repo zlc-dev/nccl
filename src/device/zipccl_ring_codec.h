@@ -15,7 +15,7 @@ using namespace zipccl::device;
 
 template<SegmentOp Op, class P>
 __device__ int codec(P& prims, int tid, int workers, const uint16_t* local, int n, float sigma, int outBase,
-                   const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense, ncclZipMoments* moments = nullptr) {
+                   const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense, ncclZipSums* sums = nullptr) {
   const auto layout = FrameLayout(n, kRingFrameAlignment);
   EncodedInput input{};
   EncodedOutput output{};
@@ -90,9 +90,9 @@ __device__ int codec(P& prims, int tid, int workers, const uint16_t* local, int 
     for (unsigned segment = warp; segment < layout.blocks * kSegmentsPerBlock; segment += warps) {
       auto* slot = slots + segment * kDreValuesPerWarp;
       if (segment < unsigned(n) / kDreValuesPerWarp)
-        ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, counts + segment, slot, shared, dense, moments);
+        ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, counts + segment, slot, shared, dense, sums);
       else
-        ProcessSegment<false, Op>(input, base, local, n, outBase, output, segment, counts + segment, slot, shared, dense, moments);
+        ProcessSegment<false, Op>(input, base, local, n, outBase, output, segment, counts + segment, slot, shared, dense, sums);
     }
   }
   prims.syncCodecWorkers();
@@ -122,7 +122,7 @@ __device__ float publishStats(P& prims, int tid, int workers, ncclZipStats& stat
   prims.syncCodecWorkers();
   for (int d = 16; d; d /= 2) {
     ncclZipMoments other{__shfl_down_sync(~0u, local.count, d), __shfl_down_sync(~0u, local.mean, d),
-                         __shfl_down_sync(~0u, local.m2, d)};
+                         __shfl_down_sync(~0u, local.m2, d), __shfl_down_sync(~0u, local.exponent, d)};
     if ((tid % 32) < d) local.merge(other);
   }
   if (tid % 32 == 0) partial[tid / 32] = local;
@@ -142,11 +142,11 @@ __device__ SliceEstimate sliceEstimate(P& prims, int tid, ncclZipStats& stats, c
     auto snapshot = atomicCAS(&stats.snapshot, 0ull, 0ull);
     // The first frame needs a window before its encoder can produce moments.
     if (!snapshot && n) {
-      ncclZipMoments pilot{};
+      ncclZipSums pilot{};
       int samples = min(n, 32);
       for (int i = 0; i < samples; ++i)
         pilot.add(__bfloat162float(__ushort_as_bfloat16(local[size_t(i) * n / samples])));
-      auto initial = (1ull << 32) | __float_as_uint(pilot.sigma());
+      auto initial = (1ull << 32) | __float_as_uint(pilot.moments().sigma());
       snapshot = atomicCAS(&stats.snapshot, 0ull, initial);
       if (!snapshot) snapshot = initial;
     }
@@ -175,22 +175,22 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
     sigma = estimate.sigma;
     if constexpr (Stage == SegmentOp::Encode) {
       if (estimate.slot < ncclZipStatSlices) {
-        ncclZipMoments moments{};
+        ncclZipSums sums{};
         int bytes;
         if (n >= ncclZipMinSliceBytes / sizeof(uint16_t)) {
           bytes = codec<SegmentOp::StatEncode>(prims, tid, workers, local, n, sigma, ncclZipWindow(sigma),
-                                               nullptr, dst, nullptr, &moments);
+                                               nullptr, dst, nullptr, &sums);
         } else {
           auto* payload = reinterpret_cast<uint16_t*>(dst + 1);
           for (int i = tid; i < n; i += workers) {
             uint16_t value = local[i];
             payload[i] = value;
-            moments.add(__bfloat162float(__ushort_as_bfloat16(value)));
+            sums.add(__bfloat162float(__ushort_as_bfloat16(value)));
           }
           if (tid == 0) *dst = {unsigned(n), 1, 0, RingFrameFormat::Raw, sigma};
           bytes = sizeof(RingFrameHeader) + n * sizeof(uint16_t);
         }
-        float updated = publishStats(prims, tid, workers, stats, estimate.slot, moments);
+        float updated = publishStats(prims, tid, workers, stats, estimate.slot, sums.moments());
         if (tid == 0) dst->sigma = updated;
         return bytes;
       }

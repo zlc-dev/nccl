@@ -179,6 +179,11 @@ __device__ __forceinline__ unsigned AddBf16Pair(unsigned a, unsigned b) {
     return __bfloat16_as_ushort(sum.x) | (unsigned(__bfloat16_as_ushort(sum.y)) << 16);
 }
 
+__device__ __forceinline__ unsigned PackSignMantissa(unsigned pair0, unsigned pair1) {
+    return (__byte_perm(pair0, pair1, 0x6420) & 0x7f7f7f7fu) |
+           (__byte_perm(pair0, pair1, 0x7531) & 0x80808080u);
+}
+
 template<bool FullSegment, SegmentOp Op = SegmentOp::Dre>
 __device__ __forceinline__ void ProcessSegment(
         EncodedInput input_a, std::uint8_t exponent_base_a,
@@ -186,7 +191,7 @@ __device__ __forceinline__ void ProcessSegment(
         std::uint8_t output_exponent_base, EncodedOutput output,
         unsigned segment, std::uint16_t* segment_count,
         std::uint8_t* segment_slot, unsigned char* shared_bytes,
-        std::uint16_t* dense_output = nullptr, ncclZipMoments* moments = nullptr) {
+        std::uint16_t* dense_output = nullptr, ncclZipSums* sums = nullptr) {
     const int warp = threadIdx.x / kWarpSize;
     const int lane = threadIdx.x % kWarpSize;
     const unsigned segment_first = segment * kDreValuesPerWarp;
@@ -344,14 +349,6 @@ __device__ __forceinline__ void ProcessSegment(
         const uint4 b_values1 = *reinterpret_cast<const uint4*>(
             shared_b_bytes +
             SwizzleBf16Tile(b_tile + 1) * kBytesPerTile);
-        if constexpr (Op == SegmentOp::StatEncode) {
-            // Accumulate the same BF16 values that this lane is about to encode.
-            const uint4 values[2] = {b_values0, b_values1};
-            #pragma unroll
-            for (int j = 0; j < 16; ++j)
-                if (FullSegment || first + half * 16 + j < elements)
-                    moments->add(__bfloat162float(__ushort_as_bfloat16(Uint4Bf16(values[j / 8], j % 8))));
-        }
         if constexpr (Op == SegmentOp::StatEncode || Op == SegmentOp::RawReduceEncode || Op == SegmentOp::Encode) {
             const uint4 values[2] = {b_values0, b_values1};
             #pragma unroll
@@ -436,21 +433,15 @@ __device__ __forceinline__ void ProcessSegment(
         }
         uint4 encoded_sign = make_uint4(0, 0, 0, 0);
         uint3 bitmap = make_uint3(0, 0, 0);
-        auto* exponent_scratch = shared_b_bytes +
-            SwizzleBf16Tile(lane * 4 + half) * kBytesPerTile;
+        auto* exponent_scratch = Op == SegmentOp::StatEncode ? warp_shared_outliers + lane * 32 + half * 16 :
+            shared_b_bytes + SwizzleBf16Tile(lane * 4 + half) * kBytesPerTile;
         if (full_segment) {
             #pragma unroll
             for (int j = 0; j < 16; j += 4) {
                 const int i = half * 16 + j;
                 const std::uint32_t pair0 = reduced_pairs[j / 2];
                 const std::uint32_t pair1 = reduced_pairs[j / 2 + 1];
-                const std::uint32_t low_bytes =
-                    __byte_perm(pair0, pair1, 0x6420);
-                const std::uint32_t high_bytes =
-                    __byte_perm(pair0, pair1, 0x7531);
-                const std::uint32_t sign_mantissa =
-                    (low_bytes & 0x7f7f7f7fu) |
-                    (high_bytes & 0x80808080u);
+                const unsigned sign_mantissa = PackSignMantissa(pair0, pair1);
                 std::uint32_t* encoded_word = j < 4 ? &encoded_sign.x :
                     j < 8 ? &encoded_sign.y :
                     j < 12 ? &encoded_sign.z : &encoded_sign.w;
@@ -552,6 +543,38 @@ __device__ __forceinline__ void ProcessSegment(
             }
         }
     }
+    if constexpr (Op == SegmentOp::StatEncode) {
+        // FIFO payload stores above can drain while we consume the original BF16 tiles.
+        // Their storage is preserved by putting output exponents in the unused input-outlier area.
+        for (unsigned tile = lane; tile < kBf16TilesPerWarp; tile += kWarpSize) {
+            const auto* src = shared_b + SwizzleBf16Tile(tile) * 8;
+            const uint4 values = *reinterpret_cast<const uint4*>(src);
+            // For a normal-range accumulator, an entire BF16 tile fits the current
+            // scale if no lane value reaches 2^40. Compare both packed halves at once.
+            unsigned large = 0;
+            #pragma unroll
+            for (int k = 0; k < 4; ++k)
+                large |= __vcmpgeu2(Uint4Word(values, k) & 0x7fff7fffu, 0x53805380u);
+            if ((FullSegment || tile * 8 + 8 <= segment_elements) &&
+                sums->count && sums->exponent == 0 && !large) {
+                float sum = 0.f, squares = 0.f;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    float delta = __bfloat162float(__ushort_as_bfloat16(Uint4Bf16(values, j))) - sums->origin;
+                    sum += delta;
+                    squares = fmaf(delta, delta, squares);
+                }
+                sums->count += 8;
+                sums->sum += sum;
+                sums->squares += squares;
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    if (FullSegment || tile * 8 + j < segment_elements)
+                        sums->add(__bfloat162float(__ushort_as_bfloat16(Uint4Bf16(values, j))));
+            }
+        }
+    }
     const std::uint32_t exceptional_out = valid & ~(out0 | out1 | out2);
     const int local_output_count = __popc(exceptional_out);
     int position = WarpExclusivePrefix(local_output_count, lane);
@@ -561,8 +584,8 @@ __device__ __forceinline__ void ProcessSegment(
     std::uint32_t pending = exceptional_out;
     while (pending != 0) {
         const int bit = __ffs(static_cast<int>(pending)) - 1;
-        const auto* exponent_scratch = shared_b_bytes +
-            SwizzleBf16Tile(lane * 4 + (bit >> 4)) * kBytesPerTile;
+        const auto* exponent_scratch = Op == SegmentOp::StatEncode ? warp_shared_outliers + lane * 32 + (bit & 16) :
+            shared_b_bytes + SwizzleBf16Tile(lane * 4 + (bit >> 4)) * kBytesPerTile;
         segment_slot[position++] = exponent_scratch[bit & 15];
         pending &= pending - 1;
     }
