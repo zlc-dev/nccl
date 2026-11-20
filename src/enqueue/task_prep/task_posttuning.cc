@@ -72,7 +72,7 @@ static void postTuningSetChunkSteps(struct ncclTaskColl* task) {
     break;
   case ncclFuncReduceScatter:
     task->chunkSteps = REDUCESCATTER_CHUNKSTEPS;
-    task->sliceSteps = REDUCESCATTER_SLICESTEPS;
+    task->sliceSteps = task->zipccl ? task->chunkSteps : REDUCESCATTER_SLICESTEPS;
     break;
   case ncclFuncBroadcast:
     task->chunkSteps = BROADCAST_CHUNKSTEPS;

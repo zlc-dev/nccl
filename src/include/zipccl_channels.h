@@ -18,7 +18,7 @@ inline int ncclZipDistinctRings(const int* rings, int channels, int ranks, int* 
   return distinct;
 }
 
-constexpr int ncclZipMaxChannelsPerRing = 8;
+constexpr int ncclZipMaxChannelsPerRing = 16;
 
 // Assign channel IDs in rounds over the distinct cycles. Every prefix gives
 // each cycle the same number of channels to within one.

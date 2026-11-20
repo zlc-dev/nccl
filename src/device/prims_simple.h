@@ -413,7 +413,12 @@ public:
           nsend = fan.nsend();
         }
 #ifdef ZIPCCL_STAGE_TIMING
-        if (trace && tid == 0) trace->codecBegin = zipStageTime();
+        if constexpr (ZipTrace) {
+          if (trace && tid == 0) {
+            trace->rawBytes = fn.eltN * sizeof(T);
+            trace->codecBegin = zipStageTime();
+          }
+        }
 #endif
         fn.template operator()<SlicePerChunk, 0, Recv * MaxRecv, 0, Send * MaxSend, MultimemSrcs, MultimemDsts>(
           tid, nworkers, slice, stepSize * StepPerSlice, nrecv, ncclShmem.groups[group].srcs, nsend,

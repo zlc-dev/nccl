@@ -353,8 +353,15 @@ ncclResult_t ncclZipCCLReduceScatterWithSigma(const void* sendbuff, void* recvbu
                                              cudaStream_t stream, const float* sigma) {
   if (sigma && (!std::isfinite(*sigma) || *sigma < 0)) return ncclInvalidArgument;
   if (datatype != ncclBfloat16 || op != ncclSum) return ncclInvalidArgument;
+  int ranks;
+  NCCLCHECK(ncclCommCount(comm, &ranks));
+  // Compare per-rank counts without multiplying a potentially large recvcount.
+  constexpr size_t minInputElements = (64u << 20) / sizeof(uint16_t);
+  const size_t minRecvCount = (minInputElements - 1) / ranks + 1;
+  if (recvcount < minRecvCount || recvcount < ncclZipMinSliceBytes / sizeof(uint16_t))
+    return ncclReduceScatter(sendbuff, recvbuff, recvcount, datatype, op, comm, stream);
   ncclInfo info = {ncclFuncReduceScatter, "ZipCCLReduceScatter", sendbuff, recvbuff, recvcount, datatype, op,
-                   0, comm, stream, REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS};
+                   0, comm, stream, REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_CHUNKSTEPS};
   ncclCollConfig_t config = NCCL_COLLCONFIG_INITIALIZER;
   config.algSelection = "RING_SIMPLE";
   config.forceAlgSelection = 1;

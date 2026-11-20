@@ -688,7 +688,9 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
       task->nMaxChannels = std::min<int>(task->nMaxChannels, task->maxCTAs);
       if (task->zipccl) {
         int limit = std::min(comm->zipChannelCapacity, task->maxCTAs);
-        int target = ncclZipChannelCount(task->count, ncclZipRawSliceBytes / sizeof(uint16_t), comm->zipRingCount, limit);
+        limit = std::min<size_t>(limit, task->count / (ncclZipMinSliceBytes / sizeof(uint16_t)));
+        int target = ncclZipChannelCount(task->count, ncclZipTargetSliceBytes / sizeof(uint16_t), comm->zipRingCount, limit);
+        target = std::min<size_t>(target, std::max<size_t>(1, task->count / (ncclZipTargetSliceBytes / sizeof(uint16_t))));
         task->nMaxChannels = std::min(limit, std::max(target, task->minCTAs));
       }
       // nvlsCTAs has no comm default (UNDEF == no cap), so it is applied only when resolved to a value.
@@ -810,7 +812,7 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
         countLo = channels == 1 ? task->count : count;
         countHi = channels == 1 ? 0 : task->count - countLo - nMidChannels * count;
       }
-      nChannels = (countLo != 0 ? 1 : 0) + nMidChannels + (cellsHi != 0 ? 1 : 0);
+      nChannels = (countLo != 0 ? 1 : 0) + nMidChannels + (countHi != 0 ? 1 : 0);
 
       // Update number of channels propagated to the profiler
       task->nChannels = (uint8_t)nChannels;
@@ -2412,9 +2414,8 @@ static ncclResult_t calcCollChunking(struct ncclComm* comm, struct ncclTaskColl*
     if (info->algorithm != NCCL_ALGO_RING || info->protocol != NCCL_PROTO_SIMPLE) return ncclInvalidUsage;
     constexpr size_t elements = ncclZipRawSliceBytes / sizeof(uint16_t);
     static_assert(sizeof(zipccl::device::RingFrameHeader) + zipccl::device::FrameLayout(elements).capacity <=
-                      ncclZipStepBytes * REDUCESCATTER_SLICESTEPS, "ZipCCL slice exceeds FIFO capacity");
-    chunkSize = std::min(chunkSize, ncclZipRawSliceBytes * (chunkSteps / sliceSteps));
-    if (chunkSize < grainSize) return ncclInvalidUsage;
+                      ncclZipStepBytes * REDUCESCATTER_CHUNKSTEPS, "ZipCCL slice exceeds FIFO capacity");
+    chunkSize = ncclZipRawSliceBytes;
   }
   switch (pattern) {
   case ncclPatternTreeUp:

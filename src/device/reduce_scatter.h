@@ -40,8 +40,14 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
   unsigned chunks = 0;
 #endif
 
-  for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+  for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += nelem) {
     nelem = min(chunkCount, channelCount - elemOffset);
+    if (Codec::IsEncoded && work->zipccl) {
+      // Share a short tail across the last two frames; preserve the proxy loop count.
+      size_t remaining = channelCount - elemOffset;
+      if (remaining > chunkCount && remaining - chunkCount < ncclZipMinSliceBytes / sizeof(T))
+        nelem = (remaining / 2) & ~size_t(7);
+    }
 
     dataOffset = gridOffset + elemOffset;
     /////////////// begin ReduceScatter steps ///////////////
@@ -87,15 +93,15 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
     // Synchronize the participating threads, including the post roles.
     barrier_sync(15, nthreads);
     if (measure) {
-      constexpr int slices = REDUCESCATTER_CHUNKSTEPS / REDUCESCATTER_SLICESTEPS;
+      constexpr int slices = 1;
       size_t total = size_t(chunks) * nranks * slices;
       for (int i = 0; i < ZipSliceTrace::capacity && size_t(i) < total; ++i) {
         const auto& t = zipTraceBuffer()[i];
         int hop = (i / slices) % nranks;
-        printf("ZIP_SLICE rank=%d channel=%d row=%d total=%llu hop=%d slice=%d "
+        printf("ZIP_SLICE rank=%d channel=%d row=%d total=%llu hop=%d slice=%d raw_bytes=%d "
                "recv=%llu,%llu send=%llu,%llu codec=%llu,%llu post=%llu,%llu\n",
                ncclShmem.comm.rank, int(ncclShmem.channelId), i, (unsigned long long)total,
-               hop, i % slices, hop ? t.recvBegin : 0ull, hop ? t.recvEnd : 0ull,
+               hop, i % slices, t.rawBytes, hop ? t.recvBegin : 0ull, hop ? t.recvEnd : 0ull,
                hop < nranks-1 ? t.sendBegin : 0ull, hop < nranks-1 ? t.sendEnd : 0ull,
                t.codecBegin, t.codecEnd, t.postBegin, t.postEnd);
       }
@@ -112,6 +118,11 @@ template <typename T, typename RedOp>
 struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     using Proto = ProtoSimple<REDUCESCATTER_CHUNKSTEPS / REDUCESCATTER_SLICESTEPS, REDUCESCATTER_SLICESTEPS>;
+    if (work->zipccl) {
+      using ZipProto = ProtoSimple<1, REDUCESCATTER_CHUNKSTEPS>;
+      runRing<T, RedOp, ZipProto>(tid, nthreads, work);
+      return;
+    }
     runRing<T, RedOp, Proto>(tid, nthreads, work);
   }
 };

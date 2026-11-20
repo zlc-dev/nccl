@@ -235,7 +235,9 @@ struct ncclNvls {
 
 #define NCCL_CONN_ZIPCCL 2
 #define NCCL_MAX_CONNS 3
-constexpr int ncclZipRawSliceBytes = 1 << 20;
+constexpr int ncclZipMinSliceBytes = 512 << 10;
+constexpr int ncclZipTargetSliceBytes = 1 << 20;
+constexpr int ncclZipRawSliceBytes = 2 << 20;
 constexpr int ncclZipStepBytes = 640 << 10;
 
 inline int ncclConnBuffSize(int connIndex, int protocol, int normalSize) {

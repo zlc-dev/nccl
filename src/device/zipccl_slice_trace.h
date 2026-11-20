@@ -6,6 +6,7 @@
 struct ZipSliceTrace {
   using Time = unsigned long long;
   static constexpr int capacity = 8;
+  int rawBytes;
   Time recvBegin, recvEnd, sendBegin, sendEnd;
   Time codecBegin, codecEnd, postBegin, postEnd;
 };
