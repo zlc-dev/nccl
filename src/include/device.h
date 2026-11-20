@@ -9,6 +9,7 @@
 #define NCCL_DEVICE_H_
 
 #include "nccl.h"
+#include "zipccl_stats.h"
 #include "nccl_device/core.h"
 #include "nccl_tuner.h"
 #include "bitops.h"
@@ -513,6 +514,7 @@ struct ncclKernelComm {
 struct alignas(16) ncclKernelCommAndChannels {
   struct ncclKernelComm comm;
   struct ncclDevChannel channels[MAXCHANNELS];
+  ncclZipStats zipStats;
 };
 
 enum ncclDevWorkStorageType : uint8_t {

@@ -324,7 +324,7 @@ __device__ __forceinline__ void ProcessSegment(
             SwizzleBf16Tile(b_tile + 1) * kBytesPerTile);
         if (Op == SegmentOp::Encode) {
             const uint4 values[2] = {b_values0, b_values1};
-#pragma unroll
+            #pragma unroll
             for (int j = 0; j < 8; ++j) reduced_pairs[j] = Uint4Word(values[j / 4], j % 4);
         } else if (full_segment) {
             #pragma unroll

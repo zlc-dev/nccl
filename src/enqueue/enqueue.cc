@@ -1922,6 +1922,14 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   bool relayUserLaunchCompletionEvent = false;
   cudaStream_t relayStream = nullptr;
 
+  // A configured ZipCCL collective owns its plan. Launch after NCCL has
+  // joined user streams so grouped calls and graph replays see current input.
+  const auto* task = ncclIntruQueueHead(&plan->collTaskQueue);
+  if (task && task->zipccl) {
+    if (task->next || task->count > SIZE_MAX / comm->nRanks) return ncclInternalError;
+    auto* workspace = &reinterpret_cast<ncclKernelCommAndChannels*>(comm->devComm)->zipStats;
+    CUDACHECK(ncclZipComputeStats(task->sendbuff, task->count * comm->nRanks, comm->zipStatsBlocks, workspace, launchStream));
+  }
   NCCLCHECK(ncclProfilerStartKernelLaunchEvent(plan, launchStream));
 
   void* extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, plan->kernelArgs, CU_LAUNCH_PARAM_BUFFER_SIZE, &plan->kernelArgsSize,

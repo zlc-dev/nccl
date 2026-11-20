@@ -13,45 +13,6 @@
 namespace ncclZipRing {
 using namespace zipccl::device;
 
-template<class P>
-__device__ float standardDeviation(const uint16_t* input, int n, int tid, int workers, P& prims) {
-  auto* partial = static_cast<double*>(prims.codecScratch());
-  double sum = 0, squares = 0;
-  for (int i = tid; i < n; i += workers) {
-    double x = __bfloat162float(__ushort_as_bfloat16(input[i]));
-    sum += x;
-    squares += x * x;
-  }
-  for (int d = 16; d; d /= 2) {
-    sum += __shfl_down_sync(0xffffffff, sum, d);
-    squares += __shfl_down_sync(0xffffffff, squares, d);
-  }
-  if ((tid % 32) == 0) {
-    partial[2 * (tid / 32)] = sum;
-    partial[2 * (tid / 32) + 1] = squares;
-  }
-  prims.syncCodecWorkers();
-  if (tid == 0) {
-    sum = squares = 0;
-    for (int w = 0; w < workers / 32; ++w) {
-      sum += partial[2*w];
-      squares += partial[2*w+1];
-    }
-    double mean = n ? sum / n : 0;
-    partial[0] = n ? sqrt(fmax(0.0, squares / n - mean * mean)) : 0;
-  }
-  prims.syncCodecWorkers();
-  return float(partial[0]);
-}
-
-__device__ inline int window(float sigma) {
-  if (!(sigma > 0) || !isfinite(sigma)) return 0;
-  float logSigma = log2f(sigma);
-  int lo = max(-127, min(121, __float2int_rd(logSigma - 5.3606617f)));
-  float x = exp2f(lo - logSigma - 0.5f);
-  return 127 + lo + (erff(256*x) - erff(2*x) > erff(128*x) - erff(x));
-}
-
 template<SegmentOp Op, class P>
 __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
                    const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense) {
@@ -59,6 +20,7 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
   EncodedInput input{};
   EncodedOutput output{};
   unsigned contributors = 1;
+  const auto& stats = reinterpret_cast<const ncclKernelCommAndChannels*>(ncclShmem.args.comm)->zipStats;
   float sigma = 0;
   int base = 0;
   if (Op != SegmentOp::Encode) {
@@ -69,9 +31,9 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
              reinterpret_cast<const uint32_t*>(data + layout.warp_offsets), data + layout.outliers};
     base = src->base;
     contributors = src->contributors + 1;
-    sigma = src->sigma * sqrtf(float(contributors) / src->contributors);
+    if (Op == SegmentOp::Dre) sigma = hypotf(src->sigma, stats.sigma);
   } else {
-    sigma = standardDeviation(local, n, tid, workers, prims);
+    sigma = stats.sigma;
   }
   if (Op != SegmentOp::Copy) {
     auto* data = reinterpret_cast<uint8_t*>(dst + 1);
@@ -80,7 +42,7 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
               reinterpret_cast<uint32_t*>(data + layout.block_offsets),
               reinterpret_cast<uint32_t*>(data + layout.warp_offsets), data + layout.outliers};
   }
-  const int outBase = Op == SegmentOp::Copy ? 0 : window(sigma);
+  const int outBase = Op == SegmentOp::Encode ? stats.base : Op == SegmentOp::Dre ? ncclZipWindow(sigma) : 0;
   // process() reserves control threads. Size each batch for the participating
   // warps and the existing NCCL CTA scratch allocation.
   constexpr int capacity = ncclShmemScratchWarpSize() * (NCCL_MAX_NTHREADS / 32);
