@@ -541,7 +541,7 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
         aggBeg->protocol = agg.protocol;
         if (aggBeg->protocol == NCCL_PROTO_LL) aggBeg->trafficBytes *= 4;
         aggBeg->nMaxChannels = agg.nMaxChannels;
-        aggBeg->nWarps = agg.nWarps;
+        aggBeg->nWarps = aggBeg->zipccl ? ncclZipTotalWarps : agg.nWarps;
         aggBeg->devFuncId = agg.devFuncId;
         aggBeg->isCollnet = isCollnet;
         aggBeg->isNvls = isNvls;
@@ -1929,6 +1929,8 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   // A configured ZipCCL collective owns its plan. Launch after NCCL has
   // joined user streams so grouped calls and graph replays see current input.
   const auto* task = ncclIntruQueueHead(&plan->collTaskQueue);
+  if (task && task->zipccl)
+    smem = std::max(smem, zipccl::device::RingDreScratchBytes(ncclZipWorkerWarps));
   if (task && task->zipccl && task->zipSigma < 0) {
     if (task->next || task->count > SIZE_MAX / comm->nRanks) return ncclInternalError;
     auto* workspace = &reinterpret_cast<ncclKernelCommAndChannels*>(comm->devComm)->zipStats;

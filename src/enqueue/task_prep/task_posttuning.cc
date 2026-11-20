@@ -591,7 +591,7 @@ static ncclResult_t applyTuningToCollTask(struct ncclComm* comm, struct ncclTask
   task->algorithm = tInfo->tuningOut.algo;
   task->protocol = tInfo->tuningOut.proto;
   task->nMaxChannels = tInfo->tuningOut.maxChannels;
-  task->nWarps = tInfo->tuningOut.nWarps;
+  task->nWarps = task->zipccl ? ncclZipTotalWarps : tInfo->tuningOut.nWarps;
   task->devFuncId = ncclDevFuncId(task->func, task->opDev.op, task->datatype, task->algorithm, task->protocol);
   task->isCollnet = 0;
   task->isNvls = 0;

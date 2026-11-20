@@ -64,7 +64,7 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
   const int outBase = Op == SegmentOp::Encode ? (suppliedSigma >= 0 ? ncclZipWindow(localSigma) : stats.base) : Op == SegmentOp::Dre ? ncclZipWindow(sigma) : 0;
   // process() reserves control threads. Size each batch for the participating
   // warps and the existing NCCL CTA scratch allocation.
-  constexpr int capacity = ncclShmemScratchWarpSize() * (NCCL_MAX_NTHREADS / 32);
+  constexpr int capacity = RingDreScratchBytes(ncclZipWorkerWarps);
   auto* shared = static_cast<uint8_t*>(prims.codecScratch());
   if constexpr (Op == SegmentOp::Copy) {
     // Copy only needs private warp scratch; there is no output to compact.
@@ -84,7 +84,8 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
   constexpr int countBytesPerBlock = kSegmentsPerBlock * sizeof(uint16_t);
   constexpr int warpLimit = (capacity - countBytesPerBlock) / kDreWarpSharedBytes;
   static_assert(warpLimit >= 1, "ZipCCL requires warp scratch and segment counts");
-  int warps = min(workers / 32, min(warpLimit, kWarpsPerCta));
+  int warps = min(workers / 32, min(warpLimit, ncclZipWorkerWarps));
+  int compactWarps = min(warps, kWarpsPerCta);
   int blocks = min(slotBytes / int(zipccl::kElementsPerBlock),
                    (capacity - warps * kDreWarpSharedBytes) / countBytesPerBlock);
   auto* comm = reinterpret_cast<const ncclKernelCommAndChannels*>(ncclShmem.args.comm);
@@ -92,22 +93,23 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
   auto* counts = reinterpret_cast<uint16_t*>(shared + warps * kDreWarpSharedBytes);
   unsigned total = 0;
   int warp = tid / 32;
+  auto* warpScratch = shared + warp * kDreWarpSharedBytes;
   prims.syncCodecWorkers();
   if constexpr (Op == SegmentOp::Dre) {
     // A full compaction group contains sixteen complete logical blocks.
     constexpr int groupElements = kWarpsPerCta * zipccl::kElementsPerBlock;
-    if (warps == kWarpsPerCta && n % groupElements == 0 && layout.blocks <= unsigned(blocks)) {
-      if (warp < kWarpsPerCta) {
-        for (int segment = warp; segment < n / kDreValuesPerWarp; segment += kWarpsPerCta)
+    if (warps == ncclZipWorkerWarps && n % groupElements == 0 && layout.blocks <= unsigned(blocks)) {
+      if (warp < ncclZipWorkerWarps) {
+        for (int segment = warp; segment < n / kDreValuesPerWarp; segment += ncclZipWorkerWarps)
           ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, counts + segment,
                                    slots + segment * kDreValuesPerWarp, shared, dense);
       }
       prims.syncCodecWorkers();
       if (warp < kWarpsPerCta) {
         for (unsigned first = 0; first < layout.blocks; first += kWarpsPerCta)
-          total = CompactSingleCta<true>(counts + first * kSegmentsPerBlock,
+          total = CompactSingleCta<true, true>(counts + first * kSegmentsPerBlock,
                                          slots + first * zipccl::kElementsPerBlock,
-                                         output, first, kWarpsPerCta, total);
+                                         output, first, kWarpsPerCta, total, warpScratch);
       }
       if (tid == 0) {
         *dst = {unsigned(n), contributors, uint16_t(outBase), RingFrameFormat::Compressed, sigma};
@@ -131,15 +133,15 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
       }
     }
     prims.syncCodecWorkers();
-    if (warp < warps) {
-      for (int i = 0; i < batch; i += warps) {
-        int group = min(warps, batch - i);
+    if (warp < compactWarps) {
+      for (int i = 0; i < batch; i += compactWarps) {
+        int group = min(compactWarps, batch - i);
         auto* groupCounts = counts + i * kSegmentsPerBlock;
         auto* groupSlots = slots + i * zipccl::kElementsPerBlock;
         if (group == kWarpsPerCta)
-          total = CompactSingleCta<true>(groupCounts, groupSlots, output, first + i, group, total);
+          total = CompactSingleCta<true, true>(groupCounts, groupSlots, output, first + i, group, total, warpScratch);
         else
-          total = CompactSingleCta<false>(groupCounts, groupSlots, output, first + i, group, total);
+          total = CompactSingleCta<false, true>(groupCounts, groupSlots, output, first + i, group, total, warpScratch);
       }
     }
     if (first + batch < layout.blocks) prims.syncCodecWorkers();

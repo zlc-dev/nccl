@@ -70,11 +70,12 @@ DEPENDS.cc = $(CXX) $(CXXFLAGS) -MM -c $1
 define DEPENDS
 @$(SAY) "Dependencies" $2;\
  mkdir -p $(dir $1);\
- mk=$$($(call DEPENDS$(suffix $2),$2));\
+ mk=$$($(call DEPENDS$(suffix $2),$2)) || exit 1;\
  [[ $$mk =~ ^[^:]*:(.*)$$ ]];\
  files=$${BASH_REMATCH[1]};\
  files=$$(for x in $$files; do case "$$x" in '\'|$$'\t') ;; *) echo "$$x"; esac; done);\
  files=$$(for x in $$files; do [[ "$$(realpath "$$x")" == "$$(realpath "$(NCCLDIR)")"* ]] && echo "$$x"; done);\
+ [[ -n "$$files" ]] || { echo "No project dependencies found for $2" >&2; exit 1; };\
  echo "$(patsubst %.d,%.o,$1) $1: " $$files > $1
 endef
 
@@ -126,7 +127,7 @@ $(OBJDIR)/genobj/symmetric/%.o: $(OBJDIR)/gensrc/symmetric $(OBJDIR)/genobj/symm
 $(OBJDIR)/%.d: %
 	$(call DEPENDS,$@,$<)
 
-$(OBJDIR)/genobj/%.d: $(OBJDIR)/gensrc/%
+$(OBJDIR)/genobj/%.d: $(OBJDIR)/gensrc/% Makefile
 	$(call DEPENDS,$@,$<)
 
 $(OBJDIR)/genobj/symmetric/%.d: $(OBJDIR)/gensrc/symmetric/%

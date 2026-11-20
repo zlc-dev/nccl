@@ -238,6 +238,9 @@ struct ncclNvls {
 constexpr int ncclZipMinSliceBytes = 512 << 10;
 constexpr int ncclZipTargetSliceBytes = 1 << 20;
 constexpr int ncclZipRawSliceBytes = 2 << 20;
+constexpr int ncclZipWorkerWarps = 19;
+constexpr int ncclZipTotalWarps = ncclZipWorkerWarps + 1;
+static_assert(ncclZipTotalWarps * WARP_SIZE <= NCCL_MAX_NTHREADS, "ZipCCL CTA exceeds thread limit");
 constexpr int ncclZipStepBytes = 640 << 10;
 
 inline int ncclConnBuffSize(int connIndex, int protocol, int normalSize) {

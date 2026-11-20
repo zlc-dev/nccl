@@ -523,7 +523,7 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   NCCLCHECKGOTO(ncclBuildRings(nChannels, rings, comm->rank, comm->nRanks, ringPrev, ringNext), ret, fail);
   comm->zipRingCount = ncclZipDistinctRings(rings, comm->collChannels, nranks, comm->zipRingSources);
   comm->zipChannelCapacity = std::min({ncclMaxNchannels(), comm->config.maxCTAs,
-                                        ncclZipMaxChannelsPerRing * comm->zipRingCount});
+                                        std::max(comm->config.minCTAs, ncclZipMaxChannelsPerRing * comm->zipRingCount)});
   if (parent && comm->sharedRes->owner != comm) {
     // A sharing child can reuse only peer tables provisioned by its parent.
     int parentChannels = std::max(parent->nChannels, parent->zipChannelCapacity);

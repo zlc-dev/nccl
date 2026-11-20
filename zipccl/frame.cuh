@@ -9,6 +9,19 @@ constexpr int kDreValuesPerWarp = 1024;
 constexpr int kSegmentsPerBlock = kElementsPerBlock / kDreValuesPerWarp;
 constexpr int kBytesPerTile = 16;
 constexpr int kDreWarpOffsetsPerBlock = kSegmentsPerBlock + 1;
+constexpr int kDreSignBytes = kDreValuesPerWarp;
+constexpr int kDreBf16Bytes = kDreValuesPerWarp * sizeof(std::uint16_t);
+constexpr int kDreBitmapBytes = kWarpSize * sizeof(std::uint32_t);
+constexpr int kDreWarpSharedBytes = kDreSignBytes + kDreBf16Bytes +
+    3 * kDreBitmapBytes + kDreValuesPerWarp + kBytesPerTile;
+
+// Keep the 19-warp ring CTA within the SM86 opt-in shared memory limit.
+// Larger slices reuse the same segment counts in successive batches.
+__host__ __device__ constexpr int RingDreScratchBytes(int warps) {
+    constexpr int elements = (1 << 20) / sizeof(std::uint16_t);
+    return warps * kDreWarpSharedBytes +
+        ((elements + kDreValuesPerWarp - 1) / kDreValuesPerWarp) * sizeof(std::uint16_t);
+}
 
 enum class RingFrameFormat : uint16_t { Compressed, Raw };
 
