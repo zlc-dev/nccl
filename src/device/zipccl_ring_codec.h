@@ -62,18 +62,15 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
               reinterpret_cast<uint32_t*>(data + layout.warp_offsets), data + layout.outliers};
   }
   const int outBase = Op == SegmentOp::Encode ? (suppliedSigma >= 0 ? ncclZipWindow(localSigma) : stats.base) : Op == SegmentOp::Dre ? ncclZipWindow(sigma) : 0;
-  // process() reserves control threads. Size each batch for the participating
-  // warps and the existing NCCL CTA scratch allocation.
-  constexpr int capacity = RingDreScratchBytes(ncclZipWorkerWarps);
+  int warps = min(workers / 32, ncclZipWorkerWarps);
   auto* shared = static_cast<uint8_t*>(prims.codecScratch());
   if constexpr (Op == SegmentOp::Copy) {
     // Copy only needs private warp scratch; there is no output to compact.
-    int copyWarps = min(workers / 32, int(capacity / kDreWarpSharedBytes));
     int warp = tid / 32;
-    if (warp < copyWarps) {
+    if (warp < warps) {
       unsigned full = unsigned(n) / kDreValuesPerWarp;
       unsigned segment = warp;
-      for (; segment < full; segment += copyWarps)
+      for (; segment < full; segment += warps)
         ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, nullptr, nullptr, shared, dense);
       if (segment == full && n % kDreValuesPerWarp)
         ProcessSegment<false, Op>(input, base, local, n, outBase, output, segment, nullptr, nullptr, shared, dense);
@@ -81,16 +78,10 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
     return 0;
   }
   constexpr int slotBytes = ncclZipRawSliceBytes / sizeof(uint16_t);
-  constexpr int countBytesPerBlock = kSegmentsPerBlock * sizeof(uint16_t);
-  constexpr int warpLimit = (capacity - countBytesPerBlock) / kDreWarpSharedBytes;
-  static_assert(warpLimit >= 1, "ZipCCL requires warp scratch and segment counts");
-  int warps = min(workers / 32, min(warpLimit, ncclZipWorkerWarps));
   int compactWarps = min(warps, kWarpsPerCta);
-  int blocks = min(slotBytes / int(zipccl::kElementsPerBlock),
-                   (capacity - warps * kDreWarpSharedBytes) / countBytesPerBlock);
   auto* comm = reinterpret_cast<const ncclKernelCommAndChannels*>(ncclShmem.args.comm);
-  auto* slots = comm->zipOutlierSlots + size_t(ncclShmem.channelId) * slotBytes;
-  auto* counts = reinterpret_cast<uint16_t*>(shared + warps * kDreWarpSharedBytes);
+  auto* slots = comm->zipOutlierSlots + size_t(ncclShmem.channelId) * RingWorkspaceBytes(slotBytes);
+  auto* counts = reinterpret_cast<uint16_t*>(slots + slotBytes);
   unsigned total = 0;
   int warp = tid / 32;
   auto* warpScratch = shared + warp * kDreWarpSharedBytes;
@@ -98,7 +89,7 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
   if constexpr (Op == SegmentOp::Dre) {
     // A full compaction group contains sixteen complete logical blocks.
     constexpr int groupElements = kWarpsPerCta * zipccl::kElementsPerBlock;
-    if (warps == ncclZipWorkerWarps && n % groupElements == 0 && layout.blocks <= unsigned(blocks)) {
+    if (warps == ncclZipWorkerWarps && n % groupElements == 0) {
       if (warp < ncclZipWorkerWarps) {
         for (int segment = warp; segment < n / kDreValuesPerWarp; segment += ncclZipWorkerWarps)
           ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, counts + segment,
@@ -118,33 +109,26 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
       return 0;
     }
   }
-  for (unsigned first = 0; first < layout.blocks; first += blocks) {
-    int batch = min(unsigned(blocks), unsigned(layout.blocks - first));
-    if (warp < warps) {
-      for (int i = warp; i < batch * kSegmentsPerBlock; i += warps) {
-        unsigned segment = first * kSegmentsPerBlock + i;
-        // Each warp owns its tile scratch. Slots and counts belong to segments.
-        if (segment < unsigned(n) / kDreValuesPerWarp)
-          ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment,
-                                      counts + i, slots + i * kDreValuesPerWarp, shared, dense);
-        else
-          ProcessSegment<false, Op>(input, base, local, n, outBase, output, segment,
-                                       counts + i, slots + i * kDreValuesPerWarp, shared, dense);
-      }
+  if (warp < warps) {
+    for (unsigned segment = warp; segment < layout.blocks * kSegmentsPerBlock; segment += warps) {
+      auto* slot = slots + segment * kDreValuesPerWarp;
+      if (segment < unsigned(n) / kDreValuesPerWarp)
+        ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, counts + segment, slot, shared, dense);
+      else
+        ProcessSegment<false, Op>(input, base, local, n, outBase, output, segment, counts + segment, slot, shared, dense);
     }
-    prims.syncCodecWorkers();
-    if (warp < compactWarps) {
-      for (int i = 0; i < batch; i += compactWarps) {
-        int group = min(compactWarps, batch - i);
-        auto* groupCounts = counts + i * kSegmentsPerBlock;
-        auto* groupSlots = slots + i * zipccl::kElementsPerBlock;
-        if (group == kWarpsPerCta)
-          total = CompactSingleCta<true, true>(groupCounts, groupSlots, output, first + i, group, total, warpScratch);
-        else
-          total = CompactSingleCta<false, true>(groupCounts, groupSlots, output, first + i, group, total, warpScratch);
-      }
+  }
+  prims.syncCodecWorkers();
+  if (warp < compactWarps) {
+    for (unsigned first = 0; first < layout.blocks; first += compactWarps) {
+      unsigned group = min(unsigned(compactWarps), unsigned(layout.blocks - first));
+      auto* groupCounts = counts + first * kSegmentsPerBlock;
+      auto* groupSlots = slots + first * zipccl::kElementsPerBlock;
+      if (group == kWarpsPerCta)
+        total = CompactSingleCta<true, true>(groupCounts, groupSlots, output, first, group, total, warpScratch);
+      else
+        total = CompactSingleCta<false, true>(groupCounts, groupSlots, output, first, group, total, warpScratch);
     }
-    if (first + batch < layout.blocks) prims.syncCodecWorkers();
   }
   if (Op != SegmentOp::Copy && tid == 0) {
     *dst = {unsigned(n), contributors, uint16_t(outBase), RingFrameFormat::Compressed, sigma};

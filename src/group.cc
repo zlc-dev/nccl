@@ -6,6 +6,7 @@
  *************************************************************************/
 
 #include "group.h"
+#include "../zipccl/frame.cuh"
 #include "debug.h"
 #include "enqueue.h"
 #include "enqueue/task_sched.h"
@@ -286,7 +287,9 @@ ncclResult_t ncclCollPreconnect(struct ncclComm* comm, bool* algoNeedConnect) {
     }
     NCCLCHECK(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_RING], NCCL_CONN_ZIPCCL));
     uint8_t* slots;
-    NCCLCHECK(ncclCudaMalloc(&slots, size_t(comm->zipChannelCapacity) * (ncclZipRawSliceBytes / sizeof(uint16_t)),
+    constexpr size_t elements = ncclZipRawSliceBytes / sizeof(uint16_t);
+    static_assert(elements % zipccl::kElementsPerBlock == 0, "Ring workspace must hold whole blocks");
+    NCCLCHECK(ncclCudaMalloc(&slots, size_t(comm->zipChannelCapacity) * zipccl::device::RingWorkspaceBytes(elements),
                              comm->memManager));
     ncclCommPushCudaFree(comm, slots);
     auto* device = reinterpret_cast<ncclKernelCommAndChannels*>(comm->devComm);
