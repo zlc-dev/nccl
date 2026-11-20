@@ -167,12 +167,12 @@ struct Rank {
   unsigned long long* errors;
 };
 
-void collective(std::vector<Rank>& ranks, size_t count) {
+void collective(std::vector<Rank>& ranks, size_t count, float sigma) {
   CHECK(ncclGroupStart());
   for (int r = 0; r < int(ranks.size()); ++r) {
     CHECK(cudaSetDevice(r));
     auto& p = ranks[r];
-    CHECK(ncclZipCCLReduceScatter(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream));
+    CHECK(ncclZipCCLReduceScatterWithSigma(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream, &sigma));
   }
   CHECK(ncclGroupEnd());
 }
@@ -214,10 +214,10 @@ int run(const Options& o) {
   for (size_t requested = o.begin;;) {
     size_t count = requested / sizeof(BF) / o.gpus;
     size_t bytes = count * sizeof(BF) * o.gpus;
-    for (int w = 0; w < o.warmup; ++w) collective(ranks, count);
+    for (int w = 0; w < o.warmup; ++w) collective(ranks, count, o.sigma);
     sync(ranks);
     auto start = std::chrono::steady_clock::now();
-    for (int n = 0; n < o.iterations; ++n) collective(ranks, count);
+    for (int n = 0; n < o.iterations; ++n) collective(ranks, count, o.sigma);
     sync(ranks);
     double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()/o.iterations;
     double alg = double(bytes)/seconds/1e9;

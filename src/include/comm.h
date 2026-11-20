@@ -212,6 +212,7 @@ struct ncclCollnetHandleList {
 struct ncclTaskColl {
   struct ncclTaskColl* next;
   bool zipccl;
+  float zipSigma;
   ncclFunc_t func;
   void const* sendbuff;
   void* recvbuff;

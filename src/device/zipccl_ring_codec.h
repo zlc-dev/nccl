@@ -14,13 +14,14 @@ namespace ncclZipRing {
 using namespace zipccl::device;
 
 template<SegmentOp Op, class P>
-__device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
+__device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n, float suppliedSigma,
                    const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense) {
   const auto layout = FrameLayout(n);
   EncodedInput input{};
   EncodedOutput output{};
   unsigned contributors = 1;
   const auto& stats = reinterpret_cast<const ncclKernelCommAndChannels*>(ncclShmem.args.comm)->zipStats;
+  const float localSigma = suppliedSigma >= 0 ? suppliedSigma : stats.sigma;
   float sigma = 0;
   int base = 0;
   if (Op != SegmentOp::Encode) {
@@ -31,9 +32,9 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
              reinterpret_cast<const uint32_t*>(data + layout.warp_offsets), data + layout.outliers};
     base = src->base;
     contributors = src->contributors + 1;
-    if (Op == SegmentOp::Dre) sigma = hypotf(src->sigma, stats.sigma);
+    if (Op == SegmentOp::Dre) sigma = hypotf(src->sigma, localSigma);
   } else {
-    sigma = stats.sigma;
+    sigma = localSigma;
   }
   if (Op != SegmentOp::Copy) {
     auto* data = reinterpret_cast<uint8_t*>(dst + 1);
@@ -42,7 +43,7 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
               reinterpret_cast<uint32_t*>(data + layout.block_offsets),
               reinterpret_cast<uint32_t*>(data + layout.warp_offsets), data + layout.outliers};
   }
-  const int outBase = Op == SegmentOp::Encode ? stats.base : Op == SegmentOp::Dre ? ncclZipWindow(sigma) : 0;
+  const int outBase = Op == SegmentOp::Encode ? (suppliedSigma >= 0 ? ncclZipWindow(localSigma) : stats.base) : Op == SegmentOp::Dre ? ncclZipWindow(sigma) : 0;
   // process() reserves control threads. Size each batch for the participating
   // warps and the existing NCCL CTA scratch allocation.
   constexpr int capacity = ncclShmemScratchWarpSize() * (NCCL_MAX_NTHREADS / 32);
@@ -102,7 +103,7 @@ struct ZipCclRingProcess {
     const auto* local = static_cast<const uint16_t*>(work->sendbuff) + inpIx + begin;
     auto* dense = Stage == 2 ? static_cast<uint16_t*>(work->recvbuff) + outIx + begin : nullptr;
     constexpr SegmentOp op = Stage == 0 ? SegmentOp::Encode : Stage == 1 ? SegmentOp::Dre : SegmentOp::Copy;
-    int bytes = run<op>(*prims, tid, workers, local, n, Stage ? static_cast<RingFrameHeader*>(srcs[0]) : nullptr,
+    int bytes = run<op>(*prims, tid, workers, local, n, work->zipSigma, Stage ? static_cast<RingFrameHeader*>(srcs[0]) : nullptr,
                         Stage == 2 ? nullptr : static_cast<RingFrameHeader*>(dsts[0]), dense);
     if (Stage != 2 && tid == 0) sizes[0] = (bytes + 1)/2;
   }

@@ -377,6 +377,7 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
     devWork.root = task->root;
     devWork.nWarps = task->nWarps;
     devWork.zipccl = task->zipccl;
+    devWork.zipSigma = task->zipSigma;
     devWork.redOpArg = task->opDev.scalarArg;
     devWork.redOpArgIsPtr = task->opDev.scalarArgIsPtr;
     devWork.oneNode = (comm->nNodes == 1);
@@ -600,6 +601,7 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
       devWork.root = task->root;
       devWork.nWarps = task->nWarps;
       devWork.zipccl = task->zipccl;
+      devWork.zipSigma = task->zipSigma;
       devWork.redOpArg = task->opDev.scalarArg;
       devWork.redOpArgIsPtr = task->opDev.scalarArgIsPtr;
       devWork.oneNode = (comm->nNodes == 1);
@@ -1925,7 +1927,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   // A configured ZipCCL collective owns its plan. Launch after NCCL has
   // joined user streams so grouped calls and graph replays see current input.
   const auto* task = ncclIntruQueueHead(&plan->collTaskQueue);
-  if (task && task->zipccl) {
+  if (task && task->zipccl && task->zipSigma < 0) {
     if (task->next || task->count > SIZE_MAX / comm->nRanks) return ncclInternalError;
     auto* workspace = &reinterpret_cast<ncclKernelCommAndChannels*>(comm->devComm)->zipStats;
     CUDACHECK(ncclZipComputeStats(task->sendbuff, task->count * comm->nRanks, comm->zipStatsBlocks, workspace, launchStream));
@@ -2854,6 +2856,7 @@ static ncclResult_t collTaskAppend(struct ncclComm* comm, struct ncclInfo* info,
     }
     t->trafficBytes = t->count * elementSize * ncclFuncTrafficPerByte(t->func, comm->nRanks);
     t->zipccl = info->zipccl;
+    t->zipSigma = info->zipSigma;
     t->opHost = info->op;
     t->opDev = opDev; // C++ struct assignment
     t->chunkSteps = info->chunkSteps;
@@ -3343,6 +3346,7 @@ static ncclResult_t rawTaskAppend(struct ncclComm* comm, struct ncclInfo* info) 
     t->coll.datatype = info->datatype;
     t->coll.opHost = info->op;
     t->coll.zipccl = info->zipccl;
+    t->coll.zipSigma = info->zipSigma;
     t->coll.opDev = opDev;
     t->coll.stream = info->stream;
     t->coll.collConfig = info->collConfig;

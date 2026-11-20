@@ -105,6 +105,7 @@ static ncclResult_t fillCollTaskFromRaw(struct ncclComm* comm, struct ncclTaskTu
   task->trafficBytes = task->count * elementSize * postTuningFuncTrafficPerByte(task->func, comm->nRanks);
   task->opHost = raw->opHost;
   task->zipccl = raw->zipccl;
+  task->zipSigma = raw->zipSigma;
   task->opDev = raw->opDev;
   postTuningSetChunkSteps(task);
   task->launchCompletionEvent = ncclCollConfigGetLaunchCompletionEvent(&raw->collConfig);
@@ -653,6 +654,7 @@ static ncclResult_t postTuneLegacyEnqueueCollWork(
   devWork.root = task->root;
   devWork.nWarps = task->nWarps;
   devWork.zipccl = task->zipccl;
+  devWork.zipSigma = task->zipSigma;
   devWork.redOpArg = task->opDev.scalarArg;
   devWork.redOpArgIsPtr = task->opDev.scalarArgIsPtr;
   devWork.oneNode = (comm->nNodes == 1);

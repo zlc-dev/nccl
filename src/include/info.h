@@ -42,6 +42,7 @@ struct ncclInfo {
   // during synchronous host scheduling (never at launch/replay).
   ncclCollConfig_t collConfig;
   bool zipccl;
+  float zipSigma;
 };
 
 #endif

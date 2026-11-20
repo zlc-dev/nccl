@@ -7,6 +7,7 @@
 
 #include "argcheck.h" // Need some checks here since we access comm
 #include "collectives.h"
+#include <cmath>
 #include "config/collconfig.h"
 #include "enqueue.h"
 #include "nccl.h"
@@ -342,6 +343,15 @@ NCCL_API(ncclResult_t, ncclZipCCLReduceScatter, const void* sendbuff, void* recv
          ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
 ncclResult_t ncclZipCCLReduceScatter(const void* sendbuff, void* recvbuff, size_t recvcount, ncclDataType_t datatype,
                                      ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
+  return ncclZipCCLReduceScatterWithSigma(sendbuff, recvbuff, recvcount, datatype, op, comm, stream, nullptr);
+}
+
+NCCL_API(ncclResult_t, ncclZipCCLReduceScatterWithSigma, const void* sendbuff, void* recvbuff, size_t recvcount,
+         ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream, const float* sigma);
+ncclResult_t ncclZipCCLReduceScatterWithSigma(const void* sendbuff, void* recvbuff, size_t recvcount,
+                                             ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm,
+                                             cudaStream_t stream, const float* sigma) {
+  if (sigma && (!std::isfinite(*sigma) || *sigma < 0)) return ncclInvalidArgument;
   if (datatype != ncclBfloat16 || op != ncclSum) return ncclInvalidArgument;
   ncclInfo info = {ncclFuncReduceScatter, "ZipCCLReduceScatter", sendbuff, recvbuff, recvcount, datatype, op,
                    0, comm, stream, REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS};
@@ -350,6 +360,7 @@ ncclResult_t ncclZipCCLReduceScatter(const void* sendbuff, void* recvbuff, size_
   config.forceAlgSelection = 1;
   NCCLCHECK(ncclParseCollConfig(&config, &info.collConfig));
   info.zipccl = true;
+  info.zipSigma = sigma ? *sigma : -1.0f;
   return ncclEnqueueCheck(&info);
 }
 

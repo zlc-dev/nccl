@@ -622,6 +622,14 @@ ncclResult_t pncclReduceScatter(const void* sendbuff, void* recvbuff,
     size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
     cudaStream_t stream);
 
+/* Rank-local input standard deviation, copied from host at call time. NULL selects device measurement. */
+ncclResult_t  ncclZipCCLReduceScatterWithSigma(const void* sendbuff, void* recvbuff,
+    size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
+    cudaStream_t stream, const float* sigma);
+ncclResult_t pncclZipCCLReduceScatterWithSigma(const void* sendbuff, void* recvbuff,
+    size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
+    cudaStream_t stream, const float* sigma);
+
 /* ZipCCL lossless BF16 encoding on Ring/Simple Sum. */
 ncclResult_t  ncclZipCCLReduceScatter(const void* sendbuff, void* recvbuff,
     size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
