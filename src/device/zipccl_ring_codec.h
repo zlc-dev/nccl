@@ -21,10 +21,7 @@ __device__ int codec(P& prims, int tid, int workers, const uint16_t* local, int 
   EncodedOutput output{};
   unsigned contributors = 1;
   int base = 0;
-  if constexpr (Op == SegmentOp::RawReduceEncode) {
-    input.raw = reinterpret_cast<const uint16_t*>(src + 1);
-    contributors = src->contributors + 1;
-  } else if constexpr (Op == SegmentOp::Copy) {
+  if constexpr (Op == SegmentOp::Dre || Op == SegmentOp::Copy) {
     const auto* data = reinterpret_cast<const uint8_t*>(src + 1);
     input = {data, reinterpret_cast<const uint32_t*>(data + layout.bitmap[0]),
              reinterpret_cast<const uint32_t*>(data + layout.bitmap[1]),
@@ -32,6 +29,7 @@ __device__ int codec(P& prims, int tid, int workers, const uint16_t* local, int 
              reinterpret_cast<const uint32_t*>(data + layout.block_offsets),
              reinterpret_cast<const uint32_t*>(data + layout.warp_offsets), data + layout.outliers};
     base = src->base;
+    if constexpr (Op == SegmentOp::Dre) contributors = src->contributors + 1;
   }
   if (Op != SegmentOp::Copy) {
     auto* data = reinterpret_cast<uint8_t*>(dst + 1);
@@ -65,7 +63,7 @@ __device__ int codec(P& prims, int tid, int workers, const uint16_t* local, int 
   int warp = tid / 32;
   auto* warpScratch = shared + warp * kDreWarpSharedBytes;
   prims.syncCodecWorkers();
-  if constexpr (Op == SegmentOp::RawReduceEncode) {
+  if constexpr (Op == SegmentOp::Dre) {
     // A full compaction group contains sixteen complete logical blocks.
     constexpr int groupElements = kWarpsPerCta * zipccl::kElementsPerBlock;
     if (warps == ncclZipWorkerWarps && n % groupElements == 0) {
@@ -126,10 +124,9 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
     const auto& stats = reinterpret_cast<const ncclKernelCommAndChannels*>(ncclShmem.args.comm)->zipStats;
     sigma = suppliedSigma >= 0 ? suppliedSigma : stats.sigma;
     if constexpr (Stage == SegmentOp::Dre) sigma = hypotf(src->sigma, sigma);
-    if (n >= ncclZipMinSliceBytes / sizeof(uint16_t) && ((ncclShmem.channelId ^ hop) & 1) == 0) {
-      constexpr SegmentOp op = Stage == SegmentOp::Encode ? SegmentOp::Encode : SegmentOp::RawReduceEncode;
+    if (Stage == SegmentOp::Encode ? n >= ncclZipMinSliceBytes / sizeof(uint16_t) : compressedInput) {
       int base = Stage == SegmentOp::Encode && suppliedSigma < 0 ? stats.base : ncclZipWindow(sigma);
-      return codec<op>(prims, tid, workers, local, n, sigma, base, src, dst, nullptr);
+      return codec<Stage>(prims, tid, workers, local, n, sigma, base, src, dst, nullptr);
     }
     dense = reinterpret_cast<uint16_t*>(dst + 1);
   }
