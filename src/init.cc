@@ -731,12 +731,6 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.comm.rankToLocalRank, comm->rankToLocalRank, comm->nRanks,
                                     deviceStream),
                 ret, fail);
-  if (nRanks > 1) {
-    CUDACHECKGOTO(ncclZipStatsGridSize(comm->cudaDev, &comm->zipStatsBlocks), ret, fail);
-    NCCLCHECKGOTO(ncclCudaCallocAsync(&tmpCommAndChans.zipStats.partial, comm->zipStatsBlocks, deviceStream,
-                                      comm->memManager), ret, fail);
-    ncclCommPushCudaFree(comm, tmpCommAndChans.zipStats.partial);
-  }
   comm->devComm = &devCommAndChans->comm;
   tmpCommAndChans.comm.rank = comm->rank;
   tmpCommAndChans.comm.nRanks = nRanks;

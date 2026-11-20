@@ -1932,9 +1932,9 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   if (task && task->zipccl)
     smem = std::max(smem, zipccl::device::RingDreScratchBytes(ncclZipWorkerWarps));
   if (task && task->zipccl && task->zipSigma < 0) {
-    if (task->next || task->count > SIZE_MAX / comm->nRanks) return ncclInternalError;
+    if (task->next) return ncclInternalError;
     auto* workspace = &reinterpret_cast<ncclKernelCommAndChannels*>(comm->devComm)->zipStats;
-    CUDACHECK(ncclZipComputeStats(task->sendbuff, task->count * comm->nRanks, comm->zipStatsBlocks, workspace, launchStream));
+    CUDACHECK(cudaMemsetAsync(workspace, 0, sizeof(*workspace), launchStream));
   }
   NCCLCHECK(ncclProfilerStartKernelLaunchEvent(plan, launchStream));
 

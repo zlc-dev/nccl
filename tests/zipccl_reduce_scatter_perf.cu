@@ -32,11 +32,13 @@ struct Options {
   unsigned long long seed = 1234;
   float sigma = 0.02f;
   bool native = false;
+  bool supplySigma = false;
 };
 
 void usage() {
   puts("zipccl_reduce_scatter_perf [-g GPUs] [-b minBytes] [-e maxBytes] [-f factor]\n"
        "  [-w warmups] [-n iterations] [-c 0|1] [--sigma stddev] [--seed integer] [--native]\n"
+       "Without --sigma, generate inputs at sigma=0.02 and let ZipCCL estimate it.\n"
        "Sizes are total uncompressed send bytes per GPU. K/M/G use powers of 1024.\n"
        "Each GPU receives size / GPUs bytes. BF16 Sum, out-of-place, one process.");
 }
@@ -73,6 +75,7 @@ Options parse(int argc, char** argv) {
     else if (key == "--sigma") {
       size_t used;
       o.sigma = std::stof(val, &used);
+      o.supplySigma = true;
       if (used != val.size() || !std::isfinite(o.sigma) || o.sigma <= 0)
         throw std::invalid_argument("sigma must be finite and positive");
     } else {
@@ -177,7 +180,7 @@ void collective(std::vector<Rank>& ranks, size_t count, const Options& o) {
     if (o.native)
       CHECK(ncclReduceScatter(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream));
     else
-      CHECK(ncclZipCCLReduceScatterWithSigma(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream, &o.sigma));
+      CHECK(ncclZipCCLReduceScatterWithSigma(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream, o.supplySigma ? &o.sigma : nullptr));
   }
   CHECK(ncclGroupEnd());
 }
@@ -214,6 +217,7 @@ int run(const Options& o) {
   sync(ranks);
   printf("# %s BF16 Sum  out-of-place  sigma=%g seed=%llu warmup=%d iterations=%d\n",
          o.native ? "ncclReduceScatter" : "ZipCCLReduceScatter",o.sigma,o.seed,o.warmup,o.iterations);
+  if (!o.native) puts(o.supplySigma ? "# sigma supplied" : "# sigma estimated by StatEncode");
   puts("# send_bytes/GPU  recv_count/GPU  time_us  algbw_GB/s  busbw_GB/s  wrong");
   bool passed = true;
   for (size_t requested = o.begin;;) {

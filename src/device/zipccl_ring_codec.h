@@ -15,7 +15,7 @@ using namespace zipccl::device;
 
 template<SegmentOp Op, class P>
 __device__ int codec(P& prims, int tid, int workers, const uint16_t* local, int n, float sigma, int outBase,
-                   const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense) {
+                   const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense, ncclZipMoments* moments = nullptr) {
   const auto layout = FrameLayout(n, kRingFrameAlignment);
   EncodedInput input{};
   EncodedOutput output{};
@@ -90,9 +90,9 @@ __device__ int codec(P& prims, int tid, int workers, const uint16_t* local, int 
     for (unsigned segment = warp; segment < layout.blocks * kSegmentsPerBlock; segment += warps) {
       auto* slot = slots + segment * kDreValuesPerWarp;
       if (segment < unsigned(n) / kDreValuesPerWarp)
-        ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, counts + segment, slot, shared, dense);
+        ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, counts + segment, slot, shared, dense, moments);
       else
-        ProcessSegment<false, Op>(input, base, local, n, outBase, output, segment, counts + segment, slot, shared, dense);
+        ProcessSegment<false, Op>(input, base, local, n, outBase, output, segment, counts + segment, slot, shared, dense, moments);
     }
   }
   prims.syncCodecWorkers();
@@ -114,6 +114,54 @@ __device__ int codec(P& prims, int tid, int workers, const uint16_t* local, int 
   return 0;
 }
 
+// Publish a consistent aggregate of all completed StatEncode slices. Each slot has one writer.
+template<class P>
+__device__ float publishStats(P& prims, int tid, int workers, ncclZipStats& stats, unsigned slot,
+                              ncclZipMoments local) {
+  auto* partial = static_cast<ncclZipMoments*>(prims.codecScratch());
+  prims.syncCodecWorkers();
+  for (int d = 16; d; d /= 2) {
+    ncclZipMoments other{__shfl_down_sync(~0u, local.count, d), __shfl_down_sync(~0u, local.mean, d),
+                         __shfl_down_sync(~0u, local.m2, d)};
+    if ((tid % 32) < d) local.merge(other);
+  }
+  if (tid % 32 == 0) partial[tid / 32] = local;
+  prims.syncCodecWorkers();
+  if (tid != 0) return 0;
+  ncclZipMoments slice{};
+  for (int w = 0; w < workers / 32; ++w) slice.merge(partial[w]);
+  return ncclZipPublishSlice(stats, slot, slice);
+}
+
+struct SliceEstimate { float sigma; unsigned slot; };
+
+template<bool Encode, class P>
+__device__ SliceEstimate sliceEstimate(P& prims, int tid, ncclZipStats& stats, const uint16_t* local, int n) {
+  auto* shared = static_cast<SliceEstimate*>(prims.codecScratch());
+  if (tid == 0) {
+    auto snapshot = atomicCAS(&stats.snapshot, 0ull, 0ull);
+    // The first frame needs a window before its encoder can produce moments.
+    if (!snapshot && n) {
+      ncclZipMoments pilot{};
+      int samples = min(n, 32);
+      for (int i = 0; i < samples; ++i)
+        pilot.add(__bfloat162float(__ushort_as_bfloat16(local[size_t(i) * n / samples])));
+      auto initial = (1ull << 32) | __float_as_uint(pilot.sigma());
+      snapshot = atomicCAS(&stats.snapshot, 0ull, initial);
+      if (!snapshot) snapshot = initial;
+    }
+    unsigned slot = ncclZipStatSlices;
+    if (Encode && n && (snapshot >> 32) <= ncclZipStatSlices &&
+        atomicAdd(&stats.claimed, 0u) < ncclZipStatSlices)
+      slot = atomicAdd(&stats.claimed, 1u);
+    *shared = {__uint_as_float(unsigned(snapshot)), slot};
+  }
+  prims.syncCodecWorkers();
+  auto estimate = *shared;
+  prims.syncCodecWorkers();
+  return estimate;
+}
+
 template<SegmentOp Stage, class P>
 __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n, float suppliedSigma,
                    const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense) {
@@ -121,11 +169,35 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
   bool compressedInput = Stage != SegmentOp::Encode && src->format == RingFrameFormat::Compressed;
   float sigma = 0;
   if constexpr (Stage != SegmentOp::Copy) {
-    const auto& stats = reinterpret_cast<const ncclKernelCommAndChannels*>(ncclShmem.args.comm)->zipStats;
-    sigma = suppliedSigma >= 0 ? suppliedSigma : stats.sigma;
+    auto& stats = reinterpret_cast<ncclKernelCommAndChannels*>(ncclShmem.args.comm)->zipStats;
+    SliceEstimate estimate{suppliedSigma, ncclZipStatSlices};
+    if (suppliedSigma < 0) estimate = sliceEstimate<Stage == SegmentOp::Encode>(prims, tid, stats, local, n);
+    sigma = estimate.sigma;
+    if constexpr (Stage == SegmentOp::Encode) {
+      if (estimate.slot < ncclZipStatSlices) {
+        ncclZipMoments moments{};
+        int bytes;
+        if (n >= ncclZipMinSliceBytes / sizeof(uint16_t)) {
+          bytes = codec<SegmentOp::StatEncode>(prims, tid, workers, local, n, sigma, ncclZipWindow(sigma),
+                                               nullptr, dst, nullptr, &moments);
+        } else {
+          auto* payload = reinterpret_cast<uint16_t*>(dst + 1);
+          for (int i = tid; i < n; i += workers) {
+            uint16_t value = local[i];
+            payload[i] = value;
+            moments.add(__bfloat162float(__ushort_as_bfloat16(value)));
+          }
+          if (tid == 0) *dst = {unsigned(n), 1, 0, RingFrameFormat::Raw, sigma};
+          bytes = sizeof(RingFrameHeader) + n * sizeof(uint16_t);
+        }
+        float updated = publishStats(prims, tid, workers, stats, estimate.slot, moments);
+        if (tid == 0) dst->sigma = updated;
+        return bytes;
+      }
+    }
     if constexpr (Stage == SegmentOp::Dre) sigma = hypotf(src->sigma, sigma);
     if (Stage == SegmentOp::Encode ? n >= ncclZipMinSliceBytes / sizeof(uint16_t) : compressedInput) {
-      int base = Stage == SegmentOp::Encode && suppliedSigma < 0 ? stats.base : ncclZipWindow(sigma);
+      int base = ncclZipWindow(sigma);
       return codec<Stage>(prims, tid, workers, local, n, sigma, base, src, dst, nullptr);
     }
     dense = reinterpret_cast<uint16_t*>(dst + 1);

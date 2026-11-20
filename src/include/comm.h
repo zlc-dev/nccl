@@ -619,7 +619,6 @@ struct ncclComm {
   struct ncclTopoGraph graphs[NCCL_NUM_ALGORITHMS];
   int maxTreePattern;
   bool zipRingConnected;
-  int zipStatsBlocks;
   int zipRingCount;
   int zipChannelCapacity;
   int zipRingSources[MAXCHANNELS]; // representative channel for each directed cycle

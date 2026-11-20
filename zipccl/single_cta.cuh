@@ -1,6 +1,7 @@
 #pragma once
 
 #include "frame.cuh"
+#include "moments.cuh"
 #include <cuda_bf16.h>
 #include <cuda/pipeline>
 
@@ -169,7 +170,7 @@ __device__ __forceinline__ uint2 ReduceFullFourCodes(
             (static_cast<std::uint32_t>(__bfloat16_as_ushort(sum1.y)) << 16));
 }
 
-enum class SegmentOp { Encode, Dre, Copy, RawReduceEncode };
+enum class SegmentOp { StatEncode, Encode, Dre, Copy, RawReduceEncode };
 
 __device__ __forceinline__ unsigned AddBf16Pair(unsigned a, unsigned b) {
     const auto lhs = __halves2bfloat162(__ushort_as_bfloat16(a), __ushort_as_bfloat16(a >> 16));
@@ -185,7 +186,7 @@ __device__ __forceinline__ void ProcessSegment(
         std::uint8_t output_exponent_base, EncodedOutput output,
         unsigned segment, std::uint16_t* segment_count,
         std::uint8_t* segment_slot, unsigned char* shared_bytes,
-        std::uint16_t* dense_output = nullptr) {
+        std::uint16_t* dense_output = nullptr, ncclZipMoments* moments = nullptr) {
     const int warp = threadIdx.x / kWarpSize;
     const int lane = threadIdx.x % kWarpSize;
     const unsigned segment_first = segment * kDreValuesPerWarp;
@@ -343,7 +344,15 @@ __device__ __forceinline__ void ProcessSegment(
         const uint4 b_values1 = *reinterpret_cast<const uint4*>(
             shared_b_bytes +
             SwizzleBf16Tile(b_tile + 1) * kBytesPerTile);
-        if constexpr (Op == SegmentOp::RawReduceEncode || Op == SegmentOp::Encode) {
+        if constexpr (Op == SegmentOp::StatEncode) {
+            // Accumulate the same BF16 values that this lane is about to encode.
+            const uint4 values[2] = {b_values0, b_values1};
+            #pragma unroll
+            for (int j = 0; j < 16; ++j)
+                if (FullSegment || first + half * 16 + j < elements)
+                    moments->add(__bfloat162float(__ushort_as_bfloat16(Uint4Bf16(values[j / 8], j % 8))));
+        }
+        if constexpr (Op == SegmentOp::StatEncode || Op == SegmentOp::RawReduceEncode || Op == SegmentOp::Encode) {
             const uint4 values[2] = {b_values0, b_values1};
             #pragma unroll
             for (int j = 0; j < 8; ++j) reduced_pairs[j] = Uint4Word(values[j / 4], j % 4);

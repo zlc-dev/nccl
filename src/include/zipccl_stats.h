@@ -4,20 +4,19 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
-struct ncclZipMoments {
-  uint64_t count;
-  double mean;
-  double m2;
-};
+#include "../../zipccl/moments.cuh"
 
+// One immutable partial per elected Encode; snapshot packs publication version and sigma bits.
+constexpr unsigned ncclZipStatSlices = 4;
 struct ncclZipStats {
-  ncclZipMoments* partial;
-  unsigned completed;
-  float sigma;
-  int base;
+  unsigned claimed, readyMask;
+  unsigned long long snapshot;
+  ncclZipMoments partial[ncclZipStatSlices];
 };
 
 #ifdef __CUDACC__
+__device__ float ncclZipPublishSlice(ncclZipStats& stats, unsigned slot, ncclZipMoments slice);
+
 __device__ inline int ncclZipWindow(float sigma) {
   if (!(sigma > 0) || !isfinite(sigma)) return 0;
   float logSigma = log2f(sigma);
@@ -28,6 +27,4 @@ __device__ inline int ncclZipWindow(float sigma) {
 
 #endif
 
-cudaError_t ncclZipStatsGridSize(int device, int* blocks);
-cudaError_t ncclZipComputeStats(const void* input, size_t count, int maxBlocks, ncclZipStats* result, cudaStream_t stream);
 #endif
