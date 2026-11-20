@@ -10,12 +10,16 @@ constexpr int kSegmentsPerBlock = kElementsPerBlock / kDreValuesPerWarp;
 constexpr int kBytesPerTile = 16;
 constexpr int kDreWarpOffsetsPerBlock = kSegmentsPerBlock + 1;
 
+enum class RingFrameFormat : uint16_t { Compressed, Raw };
+
 struct alignas(16) RingFrameHeader {
   unsigned elements;
   unsigned contributors;
-  int base;
+  uint16_t base;
+  RingFrameFormat format;
   float sigma;
 };
+static_assert(sizeof(RingFrameHeader) == 16, "Ring frame payload must stay 16-byte aligned");
 
 __host__ __device__ constexpr Layout FrameLayout(std::size_t elements) {
     Layout layout{};

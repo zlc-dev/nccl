@@ -16,6 +16,24 @@ using namespace zipccl::device;
 template<SegmentOp Op, class P>
 __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n, float suppliedSigma,
                    const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense) {
+  bool raw = Op == SegmentOp::Encode ? n < ncclZipMinSliceBytes / sizeof(uint16_t)
+                                     : src->format == RingFrameFormat::Raw;
+  if (raw) {
+    const auto* incoming = Op == SegmentOp::Encode ? nullptr : reinterpret_cast<const uint16_t*>(src + 1);
+    auto* output = Op == SegmentOp::Copy ? dense : reinterpret_cast<uint16_t*>(dst + 1);
+    for (int i = tid; i < n; i += workers) {
+      uint16_t value = local[i];
+      if (Op != SegmentOp::Encode)
+        value = __bfloat16_as_ushort(__hadd(__ushort_as_bfloat16(incoming[i]), __ushort_as_bfloat16(value)));
+      output[i] = value;
+    }
+    if (Op != SegmentOp::Copy && tid == 0) {
+      unsigned count = Op == SegmentOp::Encode ? 1 : src->contributors + 1;
+      *dst = {unsigned(n), count, 0, RingFrameFormat::Raw, 0.0f};
+      return sizeof(RingFrameHeader) + n * sizeof(uint16_t);
+    }
+    return 0;
+  }
   const auto layout = FrameLayout(n);
   EncodedInput input{};
   EncodedOutput output{};
@@ -80,7 +98,7 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
     }
   }
   if (Op != SegmentOp::Copy && tid == 0) {
-    *dst = {unsigned(n), contributors, outBase, sigma};
+    *dst = {unsigned(n), contributors, uint16_t(outBase), RingFrameFormat::Compressed, sigma};
     return sizeof(RingFrameHeader) + layout.outliers + total;
   }
   return 0;

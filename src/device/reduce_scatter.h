@@ -42,12 +42,6 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
 
   for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += nelem) {
     nelem = min(chunkCount, channelCount - elemOffset);
-    if (Codec::IsEncoded && work->zipccl) {
-      // Share a short tail across the last two frames; preserve the proxy loop count.
-      size_t remaining = channelCount - elemOffset;
-      if (remaining > chunkCount && remaining - chunkCount < ncclZipMinSliceBytes / sizeof(T))
-        nelem = (remaining / 2) & ~size_t(7);
-    }
 
     dataOffset = gridOffset + elemOffset;
     /////////////// begin ReduceScatter steps ///////////////
