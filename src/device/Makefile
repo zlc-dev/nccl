@@ -22,6 +22,9 @@ DEVGLUE_OBJ  := $(OBJDIR)/device_glue.o
 
 INCFLAGS  = -I. -I.. -I$(BUILDDIR)/include -I../include -I../include/plugin
 NVCUFLAGS += $(INCFLAGS) --compiler-options "-fPIC -fvisibility=hidden"
+ifeq ($(ZIPCCL_STAGE_TIMING),1)
+NVCUFLAGS += -DZIPCCL_STAGE_TIMING
+endif
 CXXFLAGS  += $(INCFLAGS)
 
 NVCUFLAGS_SYM += -ccbin $(CXX) $(CXXSTD) --expt-extended-lambda -Xptxas -maxrregcount=128 -Xfatbin -compress-all

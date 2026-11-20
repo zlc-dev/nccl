@@ -117,17 +117,17 @@ struct ReduceScatterRingCodec<
   template <typename Prims> __device__ __forceinline__ static void encodeSend(
       Prims& prims, struct ncclDevWorkColl* work, intptr_t inpIx, int eltN) {
     ZipCclRingProcess<Prims, 0> fn{&prims, work, inpIx, 0, eltN};
-    prims.template process<0, 1>(fn);
+    prims.template process<0, 1, true>(fn);
   }
   template <typename Prims> __device__ __forceinline__ static void decodeReduceEncodeSend(
       Prims& prims, struct ncclDevWorkColl* work, intptr_t inpIx, int eltN) {
     ZipCclRingProcess<Prims, 1> fn{&prims, work, inpIx, 0, eltN};
-    prims.template process<1, 1>(fn);
+    prims.template process<1, 1, true>(fn);
   }
   template <typename Prims> __device__ __forceinline__ static void decodeReduceCopy(
       Prims& prims, struct ncclDevWorkColl* work, intptr_t inpIx, intptr_t outIx, int eltN, bool /*postOp*/) {
     ZipCclRingProcess<Prims, 2> fn{&prims, work, inpIx, outIx, eltN};
-    prims.template process<1, 0>(fn);
+    prims.template process<1, 0, true>(fn);
   }
 };
 

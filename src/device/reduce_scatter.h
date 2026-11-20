@@ -34,7 +34,11 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
   Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0> prims(tid, nthreads, &ring->prev, &ring->next, work->sendbuff,
                                                            work->recvbuff, work->redOpArg, 0, connIndex, connIndex);
   using Codec = ReduceScatterRingCodec<T, RedOp, Proto>;
-
+#ifdef ZIPCCL_STAGE_TIMING
+  bool measure = Codec::IsEncoded && work->zipccl && tid == 0;
+  unsigned long long encodeNs = 0, dreNs = 0, drcNs = 0;
+  unsigned chunks = 0;
+#endif
 
   for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
     nelem = min(chunkCount, channelCount - elemOffset);
@@ -44,8 +48,14 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
     // step 0: push data to next GPU
     rankDest = ringRanks[nranks - 1];
     offset = dataOffset + rankDest * count;
+#ifdef ZIPCCL_STAGE_TIMING
+    unsigned long long start = measure ? zipStageTime() : 0;
+#endif
     if (Codec::IsEncoded && work->zipccl) Codec::encodeSend(prims, work, offset, nelem);
     else prims.send(offset, nelem);
+#ifdef ZIPCCL_STAGE_TIMING
+    unsigned long long encoded = measure ? zipStageTime() : 0;
+#endif
 
     // k-2 steps: reduce and copy to next GPU
     for (int j = 2; j < nranks; ++j) {
@@ -56,11 +66,45 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
     }
 
     // step k-1: reduce this buffer and data, which will produce the final result
+#ifdef ZIPCCL_STAGE_TIMING
+    unsigned long long reduced = measure ? zipStageTime() : 0;
+#endif
     rankDest = ringRanks[0];
     offset = dataOffset + rankDest * count;
     if (Codec::IsEncoded && work->zipccl) Codec::decodeReduceCopy(prims, work, offset, dataOffset, nelem, /*postOp=*/true);
     else prims.recvReduceCopy(offset, dataOffset, nelem, true);
+#ifdef ZIPCCL_STAGE_TIMING
+    if (measure) {
+      drcNs += zipStageTime() - reduced;
+      dreNs += reduced - encoded;
+      encodeNs += encoded - start;
+      ++chunks;
+    }
+#endif
   }
+#ifdef ZIPCCL_STAGE_TIMING
+  if (Codec::IsEncoded && work->zipccl) {
+    // Synchronize the participating threads, including the post roles.
+    barrier_sync(15, nthreads);
+    if (measure) {
+      constexpr int slices = REDUCESCATTER_CHUNKSTEPS / REDUCESCATTER_SLICESTEPS;
+      size_t total = size_t(chunks) * nranks * slices;
+      for (int i = 0; i < ZipSliceTrace::capacity && size_t(i) < total; ++i) {
+        const auto& t = zipTraceBuffer()[i];
+        int hop = (i / slices) % nranks;
+        printf("ZIP_SLICE rank=%d channel=%d row=%d total=%llu hop=%d slice=%d "
+               "recv=%llu,%llu send=%llu,%llu codec=%llu,%llu post=%llu,%llu\n",
+               ncclShmem.comm.rank, int(ncclShmem.channelId), i, (unsigned long long)total,
+               hop, i % slices, hop ? t.recvBegin : 0ull, hop ? t.recvEnd : 0ull,
+               hop < nranks-1 ? t.sendBegin : 0ull, hop < nranks-1 ? t.sendEnd : 0ull,
+               t.codecBegin, t.codecEnd, t.postBegin, t.postEnd);
+      }
+    }
+  }
+  if (measure)
+    printf("ZIP_STAGE rank=%d channel=%d chunks=%u encode_ns=%llu dre_ns=%llu drc_ns=%llu\n",
+           ncclShmem.comm.rank, int(ncclShmem.channelId), chunks, encodeNs, dreNs, drcNs);
+#endif
 }
 } // namespace
 

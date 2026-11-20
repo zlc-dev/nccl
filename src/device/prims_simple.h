@@ -7,6 +7,9 @@
 
 #include "network/unpack/unpack.h"
 #include <cassert>
+#ifdef ZIPCCL_STAGE_TIMING
+#include "zipccl_slice_trace.h"
+#endif
 
 enum primsMode {
   primsModeDefault = 0,
@@ -28,6 +31,9 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
   const int tid, tidInBlock;
   const int nthreads;
   int nworkers;
+#ifdef ZIPCCL_STAGE_TIMING
+  int zipTraceSlice = 0;
+#endif
   const int stepSize;
   Fan fan;
   int index; // Peer index I'm responsible for
@@ -332,19 +338,40 @@ public:
     }
   }
 
-  template <int Recv, int Send, typename Fn>
+  template <int Recv, int Send, bool ZipTrace = false, typename Fn>
   __device__ __forceinline__ void process(Fn&& fn, uint32_t sendDirectFlag = 0, uint32_t recvDirectFlag = 0) {
     NVCC_PRAGMA_UNROLL_DISABLED
     for (int slice = 0; slice < SlicePerChunk; slice++) {
+#ifdef ZIPCCL_STAGE_TIMING
+      ZipSliceTrace* trace = nullptr;
+      if (ZipTrace && zipTraceSlice < ZipSliceTrace::capacity)
+        trace = &zipTraceBuffer()[zipTraceSlice++];
+#endif
       if (tid < nworkers) {
         int nsend, nrecv;
         if (flags & (Recv * RoleWaitRecv | Send * RoleWaitSend)) {
           const bool isSendNotRecv = (Send && Recv) ? (flags & RoleWaitSend) : Send;
           int spins = 0;
+#ifdef ZIPCCL_STAGE_TIMING
+          bool polling = trace && connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice;
+          auto begin = polling ? zipStageTime() : 0ull;
+#endif
           while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice) {
             connStepCache = loadStepValue(connStepPtr);
             if (checkAbort(flags, Aborted, spins)) break;
           }
+#ifdef ZIPCCL_STAGE_TIMING
+          if (trace) {
+            auto end = polling ? zipStageTime() : 0ull;
+            if (isSendNotRecv) {
+              trace->sendBegin = begin;
+              trace->sendEnd = end;
+            } else {
+              trace->recvBegin = begin;
+              trace->recvEnd = end;
+            }
+          }
+#endif
           void** ptrs = isSendNotRecv ? ncclShmem.groups[group].dsts : ncclShmem.groups[group].srcs;
           if ((flags & ConnFifoEnabled) && connFifo[step % NCCL_STEPS].mode == NCCL_MODE_OFFSET) {
             ssize_t offset = loadSsize(&connFifo[step % NCCL_STEPS].offset);
@@ -385,11 +412,17 @@ public:
         } else {
           nsend = fan.nsend();
         }
+#ifdef ZIPCCL_STAGE_TIMING
+        if (trace && tid == 0) trace->codecBegin = zipStageTime();
+#endif
         fn.template operator()<SlicePerChunk, 0, Recv * MaxRecv, 0, Send * MaxSend, MultimemSrcs, MultimemDsts>(
           tid, nworkers, slice, stepSize * StepPerSlice, nrecv, ncclShmem.groups[group].srcs, nsend,
           ncclShmem.groups[group].dsts, ncclShmem.groups[group].dstSizes, sendDirectFlag, recvDirectFlag);
       }
       barrier();
+#ifdef ZIPCCL_STAGE_TIMING
+      if (trace && tid == 0) trace->codecEnd = zipStageTime();
+#endif
       int32_t dstSize = 0;
       if (flags & Send * RolePostSend) {
         // Yes, for some template arguments this code will be unreachable.  That's fine.
@@ -403,10 +436,18 @@ public:
         step += StepPerSlice;
       }
       if (flags & (Recv * RolePostRecv | Send * RolePostSend)) {
+#ifdef ZIPCCL_STAGE_TIMING
+        // For DRE observe the outgoing tail. For DRC observe the incoming head.
+        bool recordPost = trace && (!Send || (flags & RolePostSend));
+        if (recordPost) trace->postBegin = zipStageTime();
+#endif
         if (Send && (!Recv || (flags & RolePostSend)) && (dstSize != 0 || (flags & ConnFifoEnabled))) {
           fence_acq_rel_sys();
         }
         st_relaxed_sys_global(connStepPtr, step);
+#ifdef ZIPCCL_STAGE_TIMING
+        if (recordPost) trace->postEnd = zipStageTime();
+#endif
       }
     }
   }
