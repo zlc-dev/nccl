@@ -93,6 +93,29 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
   unsigned total = 0;
   int warp = tid / 32;
   prims.syncCodecWorkers();
+  if constexpr (Op == SegmentOp::Dre) {
+    // A full compaction group contains sixteen complete logical blocks.
+    constexpr int groupElements = kWarpsPerCta * zipccl::kElementsPerBlock;
+    if (warps == kWarpsPerCta && n % groupElements == 0 && layout.blocks <= unsigned(blocks)) {
+      if (warp < kWarpsPerCta) {
+        for (int segment = warp; segment < n / kDreValuesPerWarp; segment += kWarpsPerCta)
+          ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, counts + segment,
+                                   slots + segment * kDreValuesPerWarp, shared, dense);
+      }
+      prims.syncCodecWorkers();
+      if (warp < kWarpsPerCta) {
+        for (unsigned first = 0; first < layout.blocks; first += kWarpsPerCta)
+          total = CompactSingleCta<true>(counts + first * kSegmentsPerBlock,
+                                         slots + first * zipccl::kElementsPerBlock,
+                                         output, first, kWarpsPerCta, total);
+      }
+      if (tid == 0) {
+        *dst = {unsigned(n), contributors, uint16_t(outBase), RingFrameFormat::Compressed, sigma};
+        return sizeof(RingFrameHeader) + layout.outliers + total;
+      }
+      return 0;
+    }
+  }
   for (unsigned first = 0; first < layout.blocks; first += blocks) {
     int batch = min(unsigned(blocks), unsigned(layout.blocks - first));
     if (warp < warps) {
