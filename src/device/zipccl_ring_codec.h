@@ -14,54 +14,33 @@ namespace ncclZipRing {
 using namespace zipccl::device;
 
 template<SegmentOp Op, class P>
-__device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n, float suppliedSigma,
+__device__ int codec(P& prims, int tid, int workers, const uint16_t* local, int n, float sigma, int outBase,
                    const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense) {
-  bool raw = Op == SegmentOp::Encode ? n < ncclZipMinSliceBytes / sizeof(uint16_t)
-                                     : src->format == RingFrameFormat::Raw;
-  if (raw) {
-    const auto* incoming = Op == SegmentOp::Encode ? nullptr : reinterpret_cast<const uint16_t*>(src + 1);
-    auto* output = Op == SegmentOp::Copy ? dense : reinterpret_cast<uint16_t*>(dst + 1);
-    for (int i = tid; i < n; i += workers) {
-      uint16_t value = local[i];
-      if (Op != SegmentOp::Encode)
-        value = __bfloat16_as_ushort(__hadd(__ushort_as_bfloat16(incoming[i]), __ushort_as_bfloat16(value)));
-      output[i] = value;
-    }
-    if (Op != SegmentOp::Copy && tid == 0) {
-      unsigned count = Op == SegmentOp::Encode ? 1 : src->contributors + 1;
-      *dst = {unsigned(n), count, 0, RingFrameFormat::Raw, 0.0f};
-      return sizeof(RingFrameHeader) + n * sizeof(uint16_t);
-    }
-    return 0;
-  }
-  const auto layout = FrameLayout(n);
+  const auto layout = FrameLayout(n, kRingFrameAlignment);
   EncodedInput input{};
   EncodedOutput output{};
   unsigned contributors = 1;
-  const auto& stats = reinterpret_cast<const ncclKernelCommAndChannels*>(ncclShmem.args.comm)->zipStats;
-  const float localSigma = suppliedSigma >= 0 ? suppliedSigma : stats.sigma;
-  float sigma = 0;
   int base = 0;
-  if (Op != SegmentOp::Encode) {
+  if constexpr (Op == SegmentOp::RawReduceEncode) {
+    input.raw = reinterpret_cast<const uint16_t*>(src + 1);
+    contributors = src->contributors + 1;
+  } else if constexpr (Op == SegmentOp::Copy) {
     const auto* data = reinterpret_cast<const uint8_t*>(src + 1);
-    const auto* words = reinterpret_cast<const uint32_t*>(data + layout.bitmap[0]);
-    input = {data, words, words + layout.bitmap_words, words + 2*layout.bitmap_words,
+    input = {data, reinterpret_cast<const uint32_t*>(data + layout.bitmap[0]),
+             reinterpret_cast<const uint32_t*>(data + layout.bitmap[1]),
+             reinterpret_cast<const uint32_t*>(data + layout.bitmap[2]),
              reinterpret_cast<const uint32_t*>(data + layout.block_offsets),
              reinterpret_cast<const uint32_t*>(data + layout.warp_offsets), data + layout.outliers};
     base = src->base;
-    contributors = src->contributors + 1;
-    if (Op == SegmentOp::Dre) sigma = hypotf(src->sigma, localSigma);
-  } else {
-    sigma = localSigma;
   }
   if (Op != SegmentOp::Copy) {
     auto* data = reinterpret_cast<uint8_t*>(dst + 1);
-    auto* words = reinterpret_cast<uint32_t*>(data + layout.bitmap[0]);
-    output = {data, words, words + layout.bitmap_words, words + 2*layout.bitmap_words,
+    output = {data, reinterpret_cast<uint32_t*>(data + layout.bitmap[0]),
+              reinterpret_cast<uint32_t*>(data + layout.bitmap[1]),
+              reinterpret_cast<uint32_t*>(data + layout.bitmap[2]),
               reinterpret_cast<uint32_t*>(data + layout.block_offsets),
               reinterpret_cast<uint32_t*>(data + layout.warp_offsets), data + layout.outliers};
   }
-  const int outBase = Op == SegmentOp::Encode ? (suppliedSigma >= 0 ? ncclZipWindow(localSigma) : stats.base) : Op == SegmentOp::Dre ? ncclZipWindow(sigma) : 0;
   int warps = min(workers / 32, ncclZipWorkerWarps);
   auto* shared = static_cast<uint8_t*>(prims.codecScratch());
   if constexpr (Op == SegmentOp::Copy) {
@@ -86,7 +65,7 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
   int warp = tid / 32;
   auto* warpScratch = shared + warp * kDreWarpSharedBytes;
   prims.syncCodecWorkers();
-  if constexpr (Op == SegmentOp::Dre) {
+  if constexpr (Op == SegmentOp::RawReduceEncode) {
     // A full compaction group contains sixteen complete logical blocks.
     constexpr int groupElements = kWarpsPerCta * zipccl::kElementsPerBlock;
     if (warps == ncclZipWorkerWarps && n % groupElements == 0) {
@@ -133,6 +112,42 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
   if (Op != SegmentOp::Copy && tid == 0) {
     *dst = {unsigned(n), contributors, uint16_t(outBase), RingFrameFormat::Compressed, sigma};
     return sizeof(RingFrameHeader) + layout.outliers + total;
+  }
+  return 0;
+}
+
+template<SegmentOp Stage, class P>
+__device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n, float suppliedSigma,
+                   const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense) {
+  unsigned hop = Stage == SegmentOp::Encode ? 0 : src->contributors;
+  bool compressedInput = Stage != SegmentOp::Encode && src->format == RingFrameFormat::Compressed;
+  float sigma = 0;
+  if constexpr (Stage != SegmentOp::Copy) {
+    const auto& stats = reinterpret_cast<const ncclKernelCommAndChannels*>(ncclShmem.args.comm)->zipStats;
+    sigma = suppliedSigma >= 0 ? suppliedSigma : stats.sigma;
+    if constexpr (Stage == SegmentOp::Dre) sigma = hypotf(src->sigma, sigma);
+    if (n >= ncclZipMinSliceBytes / sizeof(uint16_t) && ((ncclShmem.channelId ^ hop) & 1) == 0) {
+      constexpr SegmentOp op = Stage == SegmentOp::Encode ? SegmentOp::Encode : SegmentOp::RawReduceEncode;
+      int base = Stage == SegmentOp::Encode && suppliedSigma < 0 ? stats.base : ncclZipWindow(sigma);
+      return codec<op>(prims, tid, workers, local, n, sigma, base, src, dst, nullptr);
+    }
+    dense = reinterpret_cast<uint16_t*>(dst + 1);
+  }
+  if (compressedInput) {
+    codec<SegmentOp::Copy>(prims, tid, workers, local, n, 0, 0, src, nullptr, dense);
+  } else {
+    for (int i = tid; i < n; i += workers) {
+      uint16_t value = local[i];
+      if constexpr (Stage != SegmentOp::Encode) {
+        const auto* incoming = reinterpret_cast<const uint16_t*>(src + 1);
+        value = __bfloat16_as_ushort(__hadd(__ushort_as_bfloat16(incoming[i]), __ushort_as_bfloat16(value)));
+      }
+      dense[i] = value;
+    }
+  }
+  if (Stage != SegmentOp::Copy && tid == 0) {
+    *dst = {unsigned(n), hop + 1, 0, RingFrameFormat::Raw, sigma};
+    return sizeof(RingFrameHeader) + n * sizeof(uint16_t);
   }
   return 0;
 }

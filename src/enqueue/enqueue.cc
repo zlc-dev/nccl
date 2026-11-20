@@ -2415,7 +2415,11 @@ static ncclResult_t calcCollChunking(struct ncclComm* comm, struct ncclTaskColl*
   if (info->zipccl) {
     if (info->algorithm != NCCL_ALGO_RING || info->protocol != NCCL_PROTO_SIMPLE) return ncclInvalidUsage;
     constexpr size_t elements = ncclZipRawSliceBytes / sizeof(uint16_t);
-    static_assert(sizeof(zipccl::device::RingFrameHeader) + zipccl::device::FrameLayout(elements).capacity <=
+    static_assert(ncclZipStepBytes % zipccl::device::kRingFrameAlignment == 0 &&
+                  sizeof(ncclSendMem) % zipccl::device::kRingFrameAlignment == 0 &&
+                  sizeof(ncclRecvMem) % zipccl::device::kRingFrameAlignment == 0, "Unaligned ZipCCL P2P FIFO");
+    static_assert(sizeof(zipccl::device::RingFrameHeader) +
+                      zipccl::device::FrameLayout(elements, zipccl::device::kRingFrameAlignment).capacity <=
                       ncclZipStepBytes * REDUCESCATTER_CHUNKSTEPS, "ZipCCL slice exceeds FIFO capacity");
     chunkSize = ncclZipRawSliceBytes;
   }

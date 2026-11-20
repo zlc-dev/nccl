@@ -25,6 +25,7 @@ struct EncodedInput {
     const std::uint32_t* block_offsets;
     const std::uint32_t* warp_offsets;
     const std::uint8_t* outliers;
+    const std::uint16_t* raw = nullptr;
 };
 
 struct EncodedOutput {
@@ -168,7 +169,14 @@ __device__ __forceinline__ uint2 ReduceFullFourCodes(
             (static_cast<std::uint32_t>(__bfloat16_as_ushort(sum1.y)) << 16));
 }
 
-enum class SegmentOp { Encode, Dre, Copy };
+enum class SegmentOp { Encode, Dre, Copy, RawReduceEncode };
+
+__device__ __forceinline__ unsigned AddBf16Pair(unsigned a, unsigned b) {
+    const auto lhs = __halves2bfloat162(__ushort_as_bfloat16(a), __ushort_as_bfloat16(a >> 16));
+    const auto rhs = __halves2bfloat162(__ushort_as_bfloat16(b), __ushort_as_bfloat16(b >> 16));
+    const auto sum = __hadd2(lhs, rhs);
+    return __bfloat16_as_ushort(sum.x) | (unsigned(__bfloat16_as_ushort(sum.y)) << 16);
+}
 
 template<bool FullSegment, SegmentOp Op = SegmentOp::Dre>
 __device__ __forceinline__ void ProcessSegment(
@@ -207,7 +215,8 @@ __device__ __forceinline__ void ProcessSegment(
          ((1u << (elements - first)) - 1u));
     std::uint32_t warp_outlier_start = 0;
     std::uint32_t warp_outlier_end = 0;
-    if (Op != SegmentOp::Encode && lane == 0) {
+    constexpr bool decode = Op == SegmentOp::Dre || Op == SegmentOp::Copy;
+    if (decode && lane == 0) {
         const std::uint32_t offset_index =
             (segment / kSegmentsPerBlock) * kDreWarpOffsetsPerBlock + segment % kSegmentsPerBlock;
         warp_outlier_start = input_a.warp_offsets[offset_index];
@@ -216,7 +225,7 @@ __device__ __forceinline__ void ProcessSegment(
     cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
     pipe.producer_acquire();
     for (std::uint32_t tile = lane;
-         Op != SegmentOp::Encode && tile < kSignTilesPerWarp;
+         decode && tile < kSignTilesPerWarp;
          tile += kWarpSize) {
         const std::uint32_t offset = tile * kBytesPerTile;
         const std::uint32_t shared_offset =
@@ -244,7 +253,24 @@ __device__ __forceinline__ void ProcessSegment(
         const std::uint32_t offset = tile * kBytesPerTile;
         const std::uint32_t shared_offset =
             SwizzleBf16Tile(static_cast<unsigned>(tile)) * kBytesPerTile;
-        if ((FullSegment || offset + kBytesPerTile <= segment_b_bytes) &&
+        if constexpr (Op == SegmentOp::RawReduceEncode) {
+            // Reduce adjacent FIFO and local tiles before redistributing them to encoder lanes.
+            const auto* raw = input_a.raw + segment_first;
+            const unsigned elem = offset / sizeof(std::uint16_t);
+            if ((FullSegment || offset + kBytesPerTile <= segment_b_bytes) &&
+                (reinterpret_cast<uintptr_t>(input_b_bytes) & 15) == 0) {
+                const uint4 a = *reinterpret_cast<const uint4*>(raw + elem);
+                const uint4 b = *reinterpret_cast<const uint4*>(input_b_bytes + offset);
+                *reinterpret_cast<uint4*>(shared_b_bytes + shared_offset) =
+                    make_uint4(AddBf16Pair(a.x, b.x), AddBf16Pair(a.y, b.y),
+                               AddBf16Pair(a.z, b.z), AddBf16Pair(a.w, b.w));
+            } else {
+                auto* dst = reinterpret_cast<std::uint16_t*>(shared_b_bytes + shared_offset);
+                for (unsigned i = elem; i < min(elem + 8, segment_elements); ++i)
+                    dst[i - elem] = __bfloat16_as_ushort(__hadd(__ushort_as_bfloat16(raw[i]),
+                        __ushort_as_bfloat16(input_b[segment_first + i])));
+            }
+        } else if ((FullSegment || offset + kBytesPerTile <= segment_b_bytes) &&
             (reinterpret_cast<uintptr_t>(input_b_bytes) & 15) == 0) {
             cuda::memcpy_async(shared_b_bytes + shared_offset,
                                input_b_bytes + offset,
@@ -256,7 +282,7 @@ __device__ __forceinline__ void ProcessSegment(
             }
         }
     }
-    if (Op != SegmentOp::Encode && active_word) {
+    if (decode && active_word) {
         cuda::memcpy_async(shared_bitmap0 + lane, input_a.bitmap0 + word,
                            cuda::aligned_size_t<sizeof(std::uint32_t)>(
                                sizeof(std::uint32_t)), pipe);
@@ -317,7 +343,7 @@ __device__ __forceinline__ void ProcessSegment(
         const uint4 b_values1 = *reinterpret_cast<const uint4*>(
             shared_b_bytes +
             SwizzleBf16Tile(b_tile + 1) * kBytesPerTile);
-        if (Op == SegmentOp::Encode) {
+        if constexpr (Op == SegmentOp::RawReduceEncode || Op == SegmentOp::Encode) {
             const uint4 values[2] = {b_values0, b_values1};
             #pragma unroll
             for (int j = 0; j < 8; ++j) reduced_pairs[j] = Uint4Word(values[j / 4], j % 4);
