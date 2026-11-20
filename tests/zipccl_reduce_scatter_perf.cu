@@ -31,11 +31,12 @@ struct Options {
   int gpus = 4, factor = 2, warmup = 5, iterations = 20, validate = 1;
   unsigned long long seed = 1234;
   float sigma = 0.02f;
+  bool native = false;
 };
 
 void usage() {
   puts("zipccl_reduce_scatter_perf [-g GPUs] [-b minBytes] [-e maxBytes] [-f factor]\n"
-       "  [-w warmups] [-n iterations] [-c 0|1] [--sigma stddev] [--seed integer]\n"
+       "  [-w warmups] [-n iterations] [-c 0|1] [--sigma stddev] [--seed integer] [--native]\n"
        "Sizes are total uncompressed send bytes per GPU. K/M/G use powers of 1024.\n"
        "Each GPU receives size / GPUs bytes. BF16 Sum, out-of-place, one process.");
 }
@@ -63,6 +64,7 @@ Options parse(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     std::string key = argv[i];
     if (key == "-h" || key == "--help") { usage(); std::exit(0); }
+    if (key == "--native") { o.native = true; continue; }
     if (++i == argc) throw std::invalid_argument("missing value for " + key);
     std::string val = argv[i];
     if (key == "-b") o.begin = number(val, true);
@@ -167,12 +169,15 @@ struct Rank {
   unsigned long long* errors;
 };
 
-void collective(std::vector<Rank>& ranks, size_t count, float sigma) {
+void collective(std::vector<Rank>& ranks, size_t count, const Options& o) {
   CHECK(ncclGroupStart());
   for (int r = 0; r < int(ranks.size()); ++r) {
     CHECK(cudaSetDevice(r));
     auto& p = ranks[r];
-    CHECK(ncclZipCCLReduceScatterWithSigma(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream, &sigma));
+    if (o.native)
+      CHECK(ncclReduceScatter(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream));
+    else
+      CHECK(ncclZipCCLReduceScatterWithSigma(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream, &o.sigma));
   }
   CHECK(ncclGroupEnd());
 }
@@ -207,17 +212,17 @@ int run(const Options& o) {
     CHECK(cudaGetLastError());
   }
   sync(ranks);
-  printf("# BF16 Sum  Ring/Simple  out-of-place  sigma=%g seed=%llu warmup=%d iterations=%d\n",
-         o.sigma,o.seed,o.warmup,o.iterations);
+  printf("# %s BF16 Sum  out-of-place  sigma=%g seed=%llu warmup=%d iterations=%d\n",
+         o.native ? "ncclReduceScatter" : "ZipCCLReduceScatter",o.sigma,o.seed,o.warmup,o.iterations);
   puts("# send_bytes/GPU  recv_count/GPU  time_us  algbw_GB/s  busbw_GB/s  wrong");
   bool passed = true;
   for (size_t requested = o.begin;;) {
     size_t count = requested / sizeof(BF) / o.gpus;
     size_t bytes = count * sizeof(BF) * o.gpus;
-    for (int w = 0; w < o.warmup; ++w) collective(ranks, count, o.sigma);
+    for (int w = 0; w < o.warmup; ++w) collective(ranks, count, o);
     sync(ranks);
     auto start = std::chrono::steady_clock::now();
-    for (int n = 0; n < o.iterations; ++n) collective(ranks, count, o.sigma);
+    for (int n = 0; n < o.iterations; ++n) collective(ranks, count, o);
     sync(ranks);
     double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()/o.iterations;
     double alg = double(bytes)/seconds/1e9;

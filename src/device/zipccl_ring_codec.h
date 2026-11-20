@@ -68,9 +68,28 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
   constexpr int perWarp = kDreWarpSharedBytes + kDreValuesPerWarp + 16;
   static_assert(capacity >= 4 * perWarp, "ZipCCL requires one logical block of scratch");
   int warps = min(min(workers / 32, capacity / perWarp), kWarpsPerCta);
+  // Fit six blocks (24 segments) in two full rounds on sm_86.
+  constexpr int blockBytes = kSegmentsPerBlock * (kDreValuesPerWarp + int(sizeof(uint16_t)));
+  if (warps >= 12 && warps < 16 && capacity >= 12 * kDreWarpSharedBytes + 6 * blockBytes)
+    warps = 12;
   int blocks = min(warps, (capacity - warps*kDreWarpSharedBytes) /
-                                    (kSegmentsPerBlock * (kDreValuesPerWarp + int(sizeof(uint16_t)))));
+                                    blockBytes);
+  if (warps == 12 && blocks >= 6 && blocks < 9) blocks = 6;
   auto* shared = static_cast<uint8_t*>(prims.codecScratch());
+  if constexpr (Op == SegmentOp::Copy) {
+    // Copy only needs private warp scratch; there is no output to compact.
+    int copyWarps = min(workers / 32, int(capacity / kDreWarpSharedBytes));
+    int warp = tid / 32;
+    if (warp < copyWarps) {
+      unsigned full = unsigned(n) / kDreValuesPerWarp;
+      unsigned segment = warp;
+      for (; segment < full; segment += copyWarps)
+        ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, nullptr, nullptr, shared, dense);
+      if (segment == full && n % kDreValuesPerWarp)
+        ProcessSegment<false, Op>(input, base, local, n, outBase, output, segment, nullptr, nullptr, shared, dense);
+    }
+    return 0;
+  }
   auto* slots = shared + warps*kDreWarpSharedBytes;
   auto* counts = reinterpret_cast<uint16_t*>(slots + blocks * zipccl::kElementsPerBlock);
   unsigned total = 0;
