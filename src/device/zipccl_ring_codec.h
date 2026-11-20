@@ -65,16 +65,6 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
   // process() reserves control threads. Size each batch for the participating
   // warps and the existing NCCL CTA scratch allocation.
   constexpr int capacity = ncclShmemScratchWarpSize() * (NCCL_MAX_NTHREADS / 32);
-  constexpr int perWarp = kDreWarpSharedBytes + kDreValuesPerWarp + 16;
-  static_assert(capacity >= 4 * perWarp, "ZipCCL requires one logical block of scratch");
-  int warps = min(min(workers / 32, capacity / perWarp), kWarpsPerCta);
-  // Fit six blocks (24 segments) in two full rounds on sm_86.
-  constexpr int blockBytes = kSegmentsPerBlock * (kDreValuesPerWarp + int(sizeof(uint16_t)));
-  if (warps >= 12 && warps < 16 && capacity >= 12 * kDreWarpSharedBytes + 6 * blockBytes)
-    warps = 12;
-  int blocks = min(warps, (capacity - warps*kDreWarpSharedBytes) /
-                                    blockBytes);
-  if (warps == 12 && blocks >= 6 && blocks < 9) blocks = 6;
   auto* shared = static_cast<uint8_t*>(prims.codecScratch());
   if constexpr (Op == SegmentOp::Copy) {
     // Copy only needs private warp scratch; there is no output to compact.
@@ -90,8 +80,16 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
     }
     return 0;
   }
-  auto* slots = shared + warps*kDreWarpSharedBytes;
-  auto* counts = reinterpret_cast<uint16_t*>(slots + blocks * zipccl::kElementsPerBlock);
+  constexpr int slotBytes = ncclZipRawSliceBytes / sizeof(uint16_t);
+  constexpr int countBytesPerBlock = kSegmentsPerBlock * sizeof(uint16_t);
+  constexpr int warpLimit = (capacity - countBytesPerBlock) / kDreWarpSharedBytes;
+  static_assert(warpLimit >= 1, "ZipCCL requires warp scratch and segment counts");
+  int warps = min(workers / 32, min(warpLimit, kWarpsPerCta));
+  int blocks = min(slotBytes / int(zipccl::kElementsPerBlock),
+                   (capacity - warps * kDreWarpSharedBytes) / countBytesPerBlock);
+  auto* comm = reinterpret_cast<const ncclKernelCommAndChannels*>(ncclShmem.args.comm);
+  auto* slots = comm->zipOutlierSlots + size_t(ncclShmem.channelId) * slotBytes;
+  auto* counts = reinterpret_cast<uint16_t*>(shared + warps * kDreWarpSharedBytes);
   unsigned total = 0;
   int warp = tid / 32;
   prims.syncCodecWorkers();
@@ -109,12 +107,19 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
                                        counts + i, slots + i * kDreValuesPerWarp, shared, dense);
       }
     }
-    if (Op != SegmentOp::Copy) {
-      prims.syncCodecWorkers();
-      if (warp < warps)
-        total = CompactSingleCta<false>(counts, slots, output, first, batch, total);
-      prims.syncCodecWorkers();
+    prims.syncCodecWorkers();
+    if (warp < warps) {
+      for (int i = 0; i < batch; i += warps) {
+        int group = min(warps, batch - i);
+        auto* groupCounts = counts + i * kSegmentsPerBlock;
+        auto* groupSlots = slots + i * zipccl::kElementsPerBlock;
+        if (group == kWarpsPerCta)
+          total = CompactSingleCta<true>(groupCounts, groupSlots, output, first + i, group, total);
+        else
+          total = CompactSingleCta<false>(groupCounts, groupSlots, output, first + i, group, total);
+      }
     }
+    if (first + batch < layout.blocks) prims.syncCodecWorkers();
   }
   if (Op != SegmentOp::Copy && tid == 0) {
     *dst = {unsigned(n), contributors, uint16_t(outBase), RingFrameFormat::Compressed, sigma};

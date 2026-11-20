@@ -285,6 +285,12 @@ ncclResult_t ncclCollPreconnect(struct ncclComm* comm, bool* algoNeedConnect) {
       NCCLCHECK(ncclTransportP2pConnect(comm, c, 1, &ring->prev, 1, &ring->next, NCCL_CONN_ZIPCCL));
     }
     NCCLCHECK(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_RING], NCCL_CONN_ZIPCCL));
+    uint8_t* slots;
+    NCCLCHECK(ncclCudaMalloc(&slots, size_t(comm->zipChannelCapacity) * (ncclZipRawSliceBytes / sizeof(uint16_t)),
+                             comm->memManager));
+    ncclCommPushCudaFree(comm, slots);
+    auto* device = reinterpret_cast<ncclKernelCommAndChannels*>(comm->devComm);
+    NCCLCHECK(ncclCudaMemcpy(&device->zipOutlierSlots, &slots, 1));
     comm->zipRingConnected = true;
   }
   return ncclSuccess;

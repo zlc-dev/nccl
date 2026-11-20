@@ -518,6 +518,7 @@ struct alignas(16) ncclKernelCommAndChannels {
   struct ncclKernelComm comm;
   struct ncclDevChannel channels[MAXCHANNELS];
   ncclZipStats zipStats;
+  uint8_t* zipOutlierSlots; // One byte per BF16 element per logical channel.
 };
 
 enum ncclDevWorkStorageType : uint8_t {
