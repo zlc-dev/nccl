@@ -18,7 +18,7 @@ __device__ inline unsigned CompactRingBlocks(const uint16_t* counts, const uint8
     unsigned count = segment == 0 ? a : segment == 1 ? b : segment == 2 ? d : e;
     unsigned total = __shfl_sync(~0u, prefix + sum, 31);
     if (warp < blocks)
-        CopyDreBlock<true>(slots + warp * kElementsPerBlock, output, first + warp, offset, count, scratch);
+        CopyDreBlock(slots + warp * kElementsPerBlock, output, first + warp, offset, count, scratch);
     return base + total;
 }
 }

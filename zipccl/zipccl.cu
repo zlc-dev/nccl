@@ -26,6 +26,7 @@ void DecodeReduceEncodeKernel(EncodedInput input_a, std::uint8_t exponent_base_a
     auto* counts = reinterpret_cast<std::uint16_t*>(shared_bytes + kDreFixedBytes);
     const int warp = threadIdx.x / kWarpSize;
     const int lane = threadIdx.x % kWarpSize;
+    auto* warp_scratch = shared_bytes + warp * kDreWarpSharedBytes;
     const unsigned stride = gridDim.x * kBlocksPerRound;
     unsigned running_base = 0;
     for (unsigned batch = blockIdx.x * kBlocksPerRound; batch < logical_blocks;
@@ -66,18 +67,18 @@ void DecodeReduceEncodeKernel(EncodedInput input_a, std::uint8_t exponent_base_a
                 const int count = __shfl_sync(0xffffffffu, value, segment);
                 const auto* block_slots = slots + (std::size_t(r) * gridDim.x + blockIdx.x) *
                     kDreRoundSlotsBytes + local_block * kElementsPerBlock;
-                CopyDreBlock(block_slots, output, block, base + offset, count);
+                CopyDreBlock(block_slots, output, block, base + offset, count, warp_scratch);
             }
         } else {
             const unsigned blocks = min(logical_blocks - batch, unsigned(rounds * kBlocksPerRound));
             unsigned i = 0;
             for (; i + kWarpsPerCta <= blocks; i += kWarpsPerCta) {
                 running_base = CompactSingleCta<true>(counts + i * kSegmentsPerBlock,
-                    slots + i * kElementsPerBlock, output, batch + i, kWarpsPerCta, running_base);
+                    slots + i * kElementsPerBlock, output, batch + i, kWarpsPerCta, running_base, warp_scratch);
             }
             if (i < blocks) {
                 running_base = CompactSingleCta<false>(counts + i * kSegmentsPerBlock,
-                    slots + i * kElementsPerBlock, output, batch + i, blocks - i, running_base);
+                    slots + i * kElementsPerBlock, output, batch + i, blocks - i, running_base, warp_scratch);
             }
         }
         // Other warps may still read the slots this warp will reuse in the next batch.

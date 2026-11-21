@@ -607,10 +607,9 @@ __device__ __forceinline__ void ProcessSegment(
 }
 
 // A compactor warp owns one logical block. Eight lanes copy each segment.
-template<bool PackInShared = false>
 __device__ __forceinline__ void CopyDreBlock(
         const std::uint8_t* block_slots, EncodedOutput output,
-        unsigned block, unsigned offset, int count, std::uint8_t* scratch = nullptr) {
+        unsigned block, unsigned offset, int count, std::uint8_t* scratch) {
     constexpr int lanes_per_segment = kWarpSize / kSegmentsPerBlock;
     const int lane = threadIdx.x % kWarpSize;
     const int segment = lane / lanes_per_segment;
@@ -622,36 +621,32 @@ __device__ __forceinline__ void CopyDreBlock(
         if (segment == kSegmentsPerBlock - 1) offsets[kSegmentsPerBlock] = offset + count;
     }
     const auto* slot = block_slots + segment * kDreValuesPerWarp;
-    if constexpr (PackInShared) {
-        static_assert(kDreWarpSharedBytes >= kElementsPerBlock + 3, "Block staging capacity");
-        unsigned begin = __shfl_sync(0xffffffffu, offset, 0);
-        unsigned end = __shfl_sync(0xffffffffu, offset + count, kWarpSize - 1);
-        // Match the FIFO alignment so both ends of each word copy are aligned.
-        auto* packed = scratch + (begin & 3);
-        for (int j = i; j < count; j += lanes_per_segment)
-            packed[offset - begin + j] = slot[j];
-        __syncwarp();
-        unsigned bytes = end - begin;
-        unsigned head = min(bytes, (0u - begin) & 3u);
-        auto* dst = output.outliers + begin;
-        if (lane < head) dst[lane] = packed[lane];
-        unsigned words = (bytes - head) / 4;
-        for (unsigned j = lane; j < words; j += kWarpSize)
-            reinterpret_cast<std::uint32_t*>(dst + head)[j] =
-                reinterpret_cast<const std::uint32_t*>(packed + head)[j];
-        unsigned tail = head + words * 4 + lane;
-        if (tail < bytes) dst[tail] = packed[tail];
-        __syncwarp(); // All lanes must finish reading before the next block reuses scratch.
-    } else {
-        for (int j = i; j < count; j += lanes_per_segment) output.outliers[offset + j] = slot[j];
-    }
+    static_assert(kDreWarpSharedBytes >= kElementsPerBlock + 3, "Block staging capacity");
+    unsigned begin = __shfl_sync(0xffffffffu, offset, 0);
+    unsigned end = __shfl_sync(0xffffffffu, offset + count, kWarpSize - 1);
+    // Match the FIFO alignment so both ends of each word copy are aligned.
+    auto* packed = scratch + (begin & 3);
+    for (int j = i; j < count; j += lanes_per_segment)
+        packed[offset - begin + j] = slot[j];
+    __syncwarp();
+    unsigned bytes = end - begin;
+    unsigned head = min(bytes, (0u - begin) & 3u);
+    auto* dst = output.outliers + begin;
+    if (lane < head) dst[lane] = packed[lane];
+    unsigned words = (bytes - head) / 4;
+    for (unsigned j = lane; j < words; j += kWarpSize)
+        reinterpret_cast<std::uint32_t*>(dst + head)[j] =
+            reinterpret_cast<const std::uint32_t*>(packed + head)[j];
+    unsigned tail = head + words * 4 + lane;
+    if (tail < bytes) dst[tail] = packed[tail];
+    __syncwarp(); // All lanes must finish reading before the next block reuses scratch.
 }
 
-template<bool FourFullRounds, bool PackInShared = false>
+template<bool FourFullRounds>
 __device__ __forceinline__ unsigned CompactSingleCta(
         const std::uint16_t* counts, const std::uint8_t* slots,
         EncodedOutput output, unsigned first_block, unsigned blocks, unsigned base,
-        std::uint8_t* scratch = nullptr) {
+        std::uint8_t* scratch) {
     const int warp = threadIdx.x / kWarpSize;
     const int lane = threadIdx.x % kWarpSize;
     const bool valid_pair = FourFullRounds || 2 * lane < blocks * kSegmentsPerBlock;
@@ -668,7 +663,7 @@ __device__ __forceinline__ unsigned CompactSingleCta(
     const int count = (segment & 1) ? second_count : first_count;
     const int total = __shfl_sync(0xffffffffu, prefix + pair, 31);
     if (FourFullRounds || warp < blocks) {
-        CopyDreBlock<PackInShared>(slots + warp * kElementsPerBlock, output, first_block + warp,
+        CopyDreBlock(slots + warp * kElementsPerBlock, output, first_block + warp,
                                    base + segment_base, count, scratch);
     }
     return base + total;

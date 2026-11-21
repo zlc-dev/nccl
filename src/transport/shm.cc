@@ -21,6 +21,7 @@ struct shmBuffInfo {
 
 struct shmConnectInfo {
   int rank;
+  bool stageRecv;
   ncclShmIpcDesc_t desc;
   struct shmBuffInfo buf;
 };
@@ -41,7 +42,29 @@ struct shmRecvResources {
   struct ncclRecvMem* devHostMem;
 };
 
+constexpr int zipSlotSteps = REDUCESCATTER_CHUNKSTEPS;
+static_assert(2 * zipSlotSteps == NCCL_STEPS, "ZipCCL SHM needs two frame slots");
+
+struct shmStageRequest {
+  ncclRecvMem* control;
+  char* fifo;
+};
+
+struct shmStageBuffers {
+  char* fifo;
+  uint64_t* tail;
+};
+
+struct shmRecvStage {
+  shmStageRequest source;
+  shmStageBuffers local;
+  cudaStream_t stream;
+  cudaEvent_t events[2];
+  uint64_t step;
+};
+
 struct shmProxyResources {
+  shmRecvStage* stage;
   ncclShmIpcDesc_t desc;
 };
 
@@ -52,6 +75,7 @@ struct shmRequest {
 
 #define SHM_SEND_SIDE 1
 #define SHM_RECV_SIDE 2
+NCCL_PARAM(ZipShmRecvStage, "ZIP_SHM_RECV_STAGE", 1);
 NCCL_PARAM(ShmDisable, "SHM_DISABLE", 0);
 NCCL_PARAM(ShmLocality, "SHM_LOCALITY", SHM_RECV_SIDE); // 1 is sender-size, 2 is receiver-size
 static int shmLocality = 0;
@@ -138,13 +162,19 @@ static ncclResult_t shmRecvSetup(struct ncclComm* comm, struct ncclTopoGraph* gr
   if (myInfo->hostHash == peerInfo->hostHash && myInfo->pidHash == peerInfo->pidHash) req.legacy = true;
   else req.legacy = false;
 
+  const bool stage = connIndex == NCCL_CONN_ZIPCCL && ncclParamZipShmRecvStage() != 0;
+  recv->proxyConn.proxyProgress = stage ? shmTransport.recv.proxyProgress : nullptr;
   NCCLCHECK(ncclProxyConnect(comm, TRANSPORT_SHM, 0, myInfo->rank, &recv->proxyConn));
   NCCLCHECK(ncclProxyCallBlocking(comm, &recv->proxyConn, ncclProxyMsgSetup, (void*)&req, sizeof(struct shmRequest),
                                   (void*)info, sizeof(struct shmConnectInfo)));
 
   info->rank = comm->rank;
+  info->stageRecv = stage;
   resources->hostMem = (struct ncclRecvMem*)info->buf.hptr;
   resources->devHostMem = (struct ncclRecvMem*)info->buf.dptr;
+  if (stage) {
+    for (auto& slot : resources->hostMem->connFifo) slot.mode = NCCL_MODE_NORMAL;
+  }
 
   return ncclSuccess;
 }
@@ -165,6 +195,8 @@ static ncclResult_t shmSendConnect(struct ncclComm* comm, struct ncclConnect* co
     send->conn.buffs[p] = buff;
     buff += ncclConnBuffSize(send->connIndex, p, comm->buffSizes[p]);
   }
+  if (send->connIndex == NCCL_CONN_ZIPCCL && info->stageRecv)
+    send->conn.connFifo = resources->devRemHostMem->connFifo;
   send->conn.tail = &resources->devRemHostMem->tail;
   send->conn.head = &resources->devHostMem->head;
   send->conn.stepSize = ncclConnBuffSize(send->connIndex, NCCL_PROTO_SIMPLE, comm->buffSizes[NCCL_PROTO_SIMPLE]) / NCCL_STEPS;
@@ -194,8 +226,16 @@ static ncclResult_t shmRecvConnect(struct ncclComm* comm, struct ncclConnect* co
   recv->conn.tail = &resources->devHostMem->tail;
   recv->conn.stepSize = ncclConnBuffSize(recv->connIndex, NCCL_PROTO_SIMPLE, comm->buffSizes[NCCL_PROTO_SIMPLE]) / NCCL_STEPS;
 
-  // We must assign the proxyConn's proxyProgress property for proper checking at enqueue-time
-  recv->proxyConn.proxyProgress = shmTransport.recv.proxyProgress;
+  if (recv->proxyConn.proxyProgress) {
+    shmStageRequest req{resources->hostMem, shmLocality == SHM_RECV_SIDE ? (char*)(resources->hostMem + 1)
+                                                                        : (char*)(resources->remHostMem + 1)};
+    shmStageBuffers buffers{};
+    NCCLCHECK(ncclProxyCallBlocking(comm, &recv->proxyConn, ncclProxyMsgConnect, &req, sizeof(req),
+                                    &buffers, sizeof(buffers)));
+    recv->conn.buffs[NCCL_PROTO_SIMPLE] = buffers.fifo;
+    recv->conn.tail = buffers.tail;
+    INFO(NCCL_INIT | NCCL_SHM, "ZipCCL SHM recv via double-buffered host copy from rank %d", info->rank);
+  }
 
   return ncclSuccess;
 }
@@ -235,6 +275,15 @@ static ncclResult_t shmRecvProxyFree(struct ncclProxyConnection* connection, str
   struct shmProxyResources* resources = (struct shmProxyResources*)connection->transportResources;
 
   if (resources) {
+    if (auto* stage = resources->stage) {
+      if (stage->stream) CUDACHECK(cudaStreamSynchronize(stage->stream));
+      for (auto event : stage->events)
+        if (event) CUDACHECK(cudaEventDestroy(event));
+      if (stage->stream) CUDACHECK(cudaStreamDestroy(stage->stream));
+      if (stage->local.tail) NCCLCHECK(ncclCudaHostFree(stage->local.tail));
+      if (stage->local.fifo) NCCLCHECK(ncclCudaFree(stage->local.fifo, proxyState->memManager));
+      free(stage);
+    }
     NCCLCHECK(ncclShmIpcClose(&resources->desc));
     free(connection->transportResources);
     connection->transportResources = NULL;
@@ -288,6 +337,76 @@ exit:
 fail:
   free(proxyRes);
   goto exit;
+}
+
+static ncclResult_t shmRecvProxyConnect(ncclProxyConnection* connection, ncclProxyState* proxyState,
+                                        void* reqBuff, int reqSize, void* respBuff, int respSize, int* done) {
+  if (reqSize != sizeof(shmStageRequest) || respSize != sizeof(shmStageBuffers)) return ncclInternalError;
+  auto* resources = static_cast<shmProxyResources*>(connection->transportResources);
+  NCCLCHECK(ncclCalloc(&resources->stage, 1));
+  auto* stage = resources->stage;
+  stage->source = *static_cast<shmStageRequest*>(reqBuff);
+  NCCLCHECK(ncclCudaMalloc(&stage->local.fifo, NCCL_STEPS * ncclZipStepBytes, proxyState->memManager));
+  NCCLCHECK(ncclCudaHostCalloc(&stage->local.tail, 1));
+  CUDACHECK(cudaStreamCreateWithFlags(&stage->stream, cudaStreamNonBlocking));
+  for (auto& event : stage->events) CUDACHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+  *static_cast<shmStageBuffers*>(respBuff) = stage->local;
+  connection->proxyAppendPtr = &connection->proxyAppend;
+  *done = 1;
+  return ncclSuccess;
+}
+
+static ncclResult_t shmRecvProxyProgress(ncclProxyState*, ncclProxyArgs* args) {
+  if (args->state == ncclProxyOpReady) {
+    if (args->protocol != NCCL_PROTO_SIMPLE || args->sliceSteps != zipSlotSteps || args->chunkSteps != zipSlotSteps)
+      return ncclInternalError;
+    for (int s = 0; s < args->nsubs; ++s) {
+      auto& sub = args->subs[s];
+      auto* stage = static_cast<shmProxyResources*>(sub.connection->transportResources)->stage;
+      if (sub.nsteps <= 0 || sub.nsteps % zipSlotSteps != 0) return ncclInternalError;
+      sub.base = stage->step;
+      sub.transmitted = sub.done = 0;
+    }
+    args->state = ncclProxyOpProgress;
+  }
+  args->idle = 1;
+  for (int s = 0; s < args->nsubs; ++s) {
+    auto& sub = args->subs[s];
+    if (sub.done == sub.nsteps) continue;
+    auto* stage = static_cast<shmProxyResources*>(sub.connection->transportResources)->stage;
+    uint64_t next = sub.base + sub.transmitted;
+    // Sender cannot reuse either FIFO slot until the consuming CTA returns its head credit.
+    if (sub.transmitted < sub.nsteps && sub.transmitted - sub.done < NCCL_STEPS &&
+        COMPILER_ATOMIC_LOAD(&stage->source.control->tail, std::memory_order_acquire) >= next + zipSlotSteps) {
+      int slot = next % NCCL_STEPS;
+      ssize_t bytes = stage->source.control->connFifo[slot].size;
+      if (bytes < 0 || bytes > zipSlotSteps * ncclZipStepBytes) {
+        WARN("ZipCCL SHM recv invalid frame length %zd at step %llu", bytes, (unsigned long long)next);
+        return ncclInternalError;
+      }
+      int offset = slot * ncclZipStepBytes;
+      CUDACHECK(cudaMemcpyAsync(stage->local.fifo + offset, stage->source.fifo + offset, bytes,
+                                cudaMemcpyDefault, stage->stream));
+      CUDACHECK(cudaEventRecord(stage->events[slot / zipSlotSteps], stage->stream));
+      sub.transmitted += zipSlotSteps;
+      args->idle = 0;
+    }
+    if (sub.done < sub.transmitted) {
+      int slot = (sub.base + sub.done) % NCCL_STEPS;
+      cudaError_t status = CUDACLEARERROR(cudaEventQuery(stage->events[slot / zipSlotSteps]));
+      if (status == cudaErrorNotReady) continue;
+      CUDACHECK(status);
+      sub.done += zipSlotSteps;
+      COMPILER_ATOMIC_STORE(stage->local.tail, sub.base + sub.done, std::memory_order_release);
+      args->idle = 0;
+      if (sub.done == sub.nsteps) {
+        stage->step = sub.base + sub.done;
+        ++args->done;
+      }
+    }
+  }
+  if (args->done == args->nsubs) args->state = ncclProxyOpNone;
+  return ncclSuccess;
 }
 
 static void initShmLocality() {
@@ -468,5 +587,6 @@ struct ncclTransport shmTransport = {
   "SHM",
   shmCanConnect,
   {shmSendSetup, shmSendConnect, shmSendFree, NULL, shmSendProxySetup, NULL, shmSendProxyFree, NULL},
-  {shmRecvSetup, shmRecvConnect, shmRecvFree, NULL, shmRecvProxySetup, NULL, shmRecvProxyFree, NULL}
+  {shmRecvSetup, shmRecvConnect, shmRecvFree, NULL, shmRecvProxySetup, shmRecvProxyConnect, shmRecvProxyFree,
+   shmRecvProxyProgress}
 };
