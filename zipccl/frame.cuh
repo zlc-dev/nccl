@@ -24,7 +24,7 @@ __host__ __device__ constexpr size_t RingWorkspaceBytes(size_t elements) {
     return elements + (elements / kDreValuesPerWarp) * sizeof(std::uint16_t);
 }
 
-enum class RingFrameFormat : uint16_t { Compressed, Raw };
+enum class RingFrameFormat : uint16_t { Compressed, Raw, Fixed };
 
 constexpr size_t kRingFrameAlignment = 128;
 struct alignas(kRingFrameAlignment) RingFrameHeader {

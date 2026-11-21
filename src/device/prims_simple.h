@@ -5,6 +5,7 @@
  * See LICENSE.txt for more license information
  *************************************************************************/
 
+#include "zipccl_p2p.h"
 #include "network/unpack/unpack.h"
 #include <cassert>
 #ifdef ZIPCCL_STAGE_TIMING
@@ -315,6 +316,10 @@ public:
   // machine itself.
   __device__ __forceinline__ void syncCodecWorkers() {
     subBarrier();
+  }
+  __device__ bool zipFixedSend() const {
+    int next = ncclShmem.comm.channels[ncclShmem.channel.zipSourceChannel].ring.next;
+    return ncclShmem.channel.peers[next]->send[NCCL_CONN_ZIPCCL].flags & ncclZipFixedSlots;
   }
   __device__ __forceinline__ void* codecScratch() {
     // The codec is collective over all process() workers, so every worker must

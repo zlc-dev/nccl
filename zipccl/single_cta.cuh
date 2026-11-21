@@ -184,7 +184,7 @@ __device__ __forceinline__ unsigned PackSignMantissa(unsigned pair0, unsigned pa
            (__byte_perm(pair0, pair1, 0x7531) & 0x80808080u);
 }
 
-template<bool FullSegment, SegmentOp Op = SegmentOp::Dre>
+template<bool FullSegment, SegmentOp Op = SegmentOp::Dre, bool FixedInput = false, bool FixedOutput = false>
 __device__ __forceinline__ void ProcessSegment(
         EncodedInput input_a, std::uint8_t exponent_base_a,
         const std::uint16_t* __restrict__ input_b, std::uint32_t elements,
@@ -196,7 +196,7 @@ __device__ __forceinline__ void ProcessSegment(
     const int lane = threadIdx.x % kWarpSize;
     const unsigned segment_first = segment * kDreValuesPerWarp;
     if (!FullSegment && segment_first >= elements) {
-        if (Op != SegmentOp::Copy && lane == 0) *segment_count = 0;
+        if (!FixedOutput && Op != SegmentOp::Copy && lane == 0) *segment_count = 0;
         return;
     }
     auto* warp_shared = shared_bytes + warp * kDreWarpSharedBytes;
@@ -222,7 +222,7 @@ __device__ __forceinline__ void ProcessSegment(
     std::uint32_t warp_outlier_start = 0;
     std::uint32_t warp_outlier_end = 0;
     constexpr bool decode = Op == SegmentOp::Dre || Op == SegmentOp::Copy;
-    if (decode && lane == 0) {
+    if (decode && !FixedInput && lane == 0) {
         const std::uint32_t offset_index =
             (segment / kSegmentsPerBlock) * kDreWarpOffsetsPerBlock + segment % kSegmentsPerBlock;
         warp_outlier_start = input_a.warp_offsets[offset_index];
@@ -332,6 +332,12 @@ __device__ __forceinline__ void ProcessSegment(
     const std::uint32_t a2 = shared_bitmap2[lane];
     const std::uint32_t exceptional_a = valid & ~(a0 | a1 | a2);
     const int prefix_a = WarpExclusivePrefix(__popc(exceptional_a), lane);
+    if constexpr (FixedInput) {
+        unsigned count = __shfl_sync(0xffffffffu, prefix_a + __popc(exceptional_a), 31);
+        for (unsigned i = lane; i < count; i += kWarpSize)
+            warp_shared_outliers[i] = input_a.outliers[segment_first + i];
+        __syncwarp();
+    }
     const std::uint32_t outlier_base_a = outlier_alignment + prefix_a;
     const auto* shared_outliers = warp_shared_outliers;
     const bool full_segment = segment_elements == kDreValuesPerWarp;
@@ -578,7 +584,8 @@ __device__ __forceinline__ void ProcessSegment(
     const std::uint32_t exceptional_out = valid & ~(out0 | out1 | out2);
     const int local_output_count = __popc(exceptional_out);
     int position = WarpExclusivePrefix(local_output_count, lane);
-    if (lane == kWarpSize - 1) {
+    __syncwarp(); // Reuse sign scratch after all FIFO stores have read it.
+    if (!FixedOutput && lane == kWarpSize - 1) {
         *segment_count = position + local_output_count;
     }
     std::uint32_t pending = exceptional_out;
@@ -586,9 +593,16 @@ __device__ __forceinline__ void ProcessSegment(
         const int bit = __ffs(static_cast<int>(pending)) - 1;
         const auto* exponent_scratch = Op == SegmentOp::StatEncode ? warp_shared_outliers + lane * 32 + (bit & 16) :
             shared_b_bytes + SwizzleBf16Tile(lane * 4 + (bit >> 4)) * kBytesPerTile;
-        segment_slot[position++] = exponent_scratch[bit & 15];
+        shared_sign_mantissa[position++] = exponent_scratch[bit & 15];
         pending &= pending - 1;
     }
+    __syncwarp();
+    unsigned count = __shfl_sync(0xffffffffu, position, 31);
+    auto* dst = FixedOutput ? output.outliers + segment_first : segment_slot;
+    for (unsigned i = lane; i < count / 4; i += kWarpSize)
+        reinterpret_cast<uint32_t*>(dst)[i] = reinterpret_cast<const uint32_t*>(shared_sign_mantissa)[i];
+    unsigned tail = (count & ~3u) + lane;
+    if (tail < count) dst[tail] = shared_sign_mantissa[tail];
     __syncwarp();
 }
 

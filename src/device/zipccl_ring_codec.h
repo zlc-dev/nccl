@@ -8,111 +8,11 @@
 #ifndef NCCL_ZIPCCL_RING_CODEC_H_
 #define NCCL_ZIPCCL_RING_CODEC_H_
 
-#include "../../zipccl/single_cta.cuh"
+#include "zipccl_frame_codec.h"
 
 namespace ncclZipRing {
 using namespace zipccl::device;
 
-template<SegmentOp Op, class P>
-__device__ int codec(P& prims, int tid, int workers, const uint16_t* local, int n, float sigma, int outBase,
-                   const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense, ncclZipSums* sums = nullptr) {
-  const auto layout = FrameLayout(n, kRingFrameAlignment);
-  EncodedInput input{};
-  EncodedOutput output{};
-  unsigned contributors = 1;
-  int base = 0;
-  if constexpr (Op == SegmentOp::Dre || Op == SegmentOp::Copy) {
-    const auto* data = reinterpret_cast<const uint8_t*>(src + 1);
-    input = {data, reinterpret_cast<const uint32_t*>(data + layout.bitmap[0]),
-             reinterpret_cast<const uint32_t*>(data + layout.bitmap[1]),
-             reinterpret_cast<const uint32_t*>(data + layout.bitmap[2]),
-             reinterpret_cast<const uint32_t*>(data + layout.block_offsets),
-             reinterpret_cast<const uint32_t*>(data + layout.warp_offsets), data + layout.outliers};
-    base = src->base;
-    if constexpr (Op == SegmentOp::Dre) contributors = src->contributors + 1;
-  }
-  if (Op != SegmentOp::Copy) {
-    auto* data = reinterpret_cast<uint8_t*>(dst + 1);
-    output = {data, reinterpret_cast<uint32_t*>(data + layout.bitmap[0]),
-              reinterpret_cast<uint32_t*>(data + layout.bitmap[1]),
-              reinterpret_cast<uint32_t*>(data + layout.bitmap[2]),
-              reinterpret_cast<uint32_t*>(data + layout.block_offsets),
-              reinterpret_cast<uint32_t*>(data + layout.warp_offsets), data + layout.outliers};
-  }
-  int warps = min(workers / 32, ncclZipWorkerWarps);
-  auto* shared = static_cast<uint8_t*>(prims.codecScratch());
-  if constexpr (Op == SegmentOp::Copy) {
-    // Copy only needs private warp scratch; there is no output to compact.
-    int warp = tid / 32;
-    if (warp < warps) {
-      unsigned full = unsigned(n) / kDreValuesPerWarp;
-      unsigned segment = warp;
-      for (; segment < full; segment += warps)
-        ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, nullptr, nullptr, shared, dense);
-      if (segment == full && n % kDreValuesPerWarp)
-        ProcessSegment<false, Op>(input, base, local, n, outBase, output, segment, nullptr, nullptr, shared, dense);
-    }
-    return 0;
-  }
-  constexpr int slotBytes = ncclZipRawSliceBytes / sizeof(uint16_t);
-  int compactWarps = min(warps, kWarpsPerCta);
-  auto* comm = reinterpret_cast<const ncclKernelCommAndChannels*>(ncclShmem.args.comm);
-  auto* slots = comm->zipOutlierSlots + size_t(ncclShmem.channelId) * RingWorkspaceBytes(slotBytes);
-  auto* counts = reinterpret_cast<uint16_t*>(slots + slotBytes);
-  unsigned total = 0;
-  int warp = tid / 32;
-  auto* warpScratch = shared + warp * kDreWarpSharedBytes;
-  prims.syncCodecWorkers();
-  if constexpr (Op == SegmentOp::Dre) {
-    // A full compaction group contains sixteen complete logical blocks.
-    constexpr int groupElements = kWarpsPerCta * zipccl::kElementsPerBlock;
-    if (warps == ncclZipWorkerWarps && n % groupElements == 0) {
-      if (warp < ncclZipWorkerWarps) {
-        for (int segment = warp; segment < n / kDreValuesPerWarp; segment += ncclZipWorkerWarps)
-          ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, counts + segment,
-                                   slots + segment * kDreValuesPerWarp, shared, dense);
-      }
-      prims.syncCodecWorkers();
-      if (warp < kWarpsPerCta) {
-        for (unsigned first = 0; first < layout.blocks; first += kWarpsPerCta)
-          total = CompactSingleCta<true, true>(counts + first * kSegmentsPerBlock,
-                                         slots + first * zipccl::kElementsPerBlock,
-                                         output, first, kWarpsPerCta, total, warpScratch);
-      }
-      if (tid == 0) {
-        *dst = {unsigned(n), contributors, uint16_t(outBase), RingFrameFormat::Compressed, sigma};
-        return sizeof(RingFrameHeader) + layout.outliers + total;
-      }
-      return 0;
-    }
-  }
-  if (warp < warps) {
-    for (unsigned segment = warp; segment < layout.blocks * kSegmentsPerBlock; segment += warps) {
-      auto* slot = slots + segment * kDreValuesPerWarp;
-      if (segment < unsigned(n) / kDreValuesPerWarp)
-        ProcessSegment<true, Op>(input, base, local, n, outBase, output, segment, counts + segment, slot, shared, dense, sums);
-      else
-        ProcessSegment<false, Op>(input, base, local, n, outBase, output, segment, counts + segment, slot, shared, dense, sums);
-    }
-  }
-  prims.syncCodecWorkers();
-  if (warp < compactWarps) {
-    for (unsigned first = 0; first < layout.blocks; first += compactWarps) {
-      unsigned group = min(unsigned(compactWarps), unsigned(layout.blocks - first));
-      auto* groupCounts = counts + first * kSegmentsPerBlock;
-      auto* groupSlots = slots + first * zipccl::kElementsPerBlock;
-      if (group == kWarpsPerCta)
-        total = CompactSingleCta<true, true>(groupCounts, groupSlots, output, first, group, total, warpScratch);
-      else
-        total = CompactSingleCta<false, true>(groupCounts, groupSlots, output, first, group, total, warpScratch);
-    }
-  }
-  if (Op != SegmentOp::Copy && tid == 0) {
-    *dst = {unsigned(n), contributors, uint16_t(outBase), RingFrameFormat::Compressed, sigma};
-    return sizeof(RingFrameHeader) + layout.outliers + total;
-  }
-  return 0;
-}
 
 // Publish a consistent aggregate of all completed StatEncode slices. Each slot has one writer.
 template<class P>
@@ -162,61 +62,51 @@ __device__ SliceEstimate sliceEstimate(P& prims, int tid, ncclZipStats& stats, c
   return estimate;
 }
 
+using Frame = RingFrameFormat;
+
+template<bool Reduce, bool Statistics, Frame In, class P>
+__device__ int dispatchOutput(Frame out, P& p, int tid, int workers, const PayloadArgs& args, ncclZipSums* sums) {
+  if (out == Frame::Fixed) return processPayload<Reduce, Statistics, In, Frame::Fixed>(p, tid, workers, args, sums);
+  if (out == Frame::Compressed) return processPayload<Reduce, Statistics, In, Frame::Compressed>(p, tid, workers, args, sums);
+  return processPayload<Reduce, Statistics, In, Frame::Raw>(p, tid, workers, args, sums);
+}
+
 template<SegmentOp Stage, class P>
 __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n, float suppliedSigma,
-                   const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense) {
-  unsigned hop = Stage == SegmentOp::Encode ? 0 : src->contributors;
-  bool compressedInput = Stage != SegmentOp::Encode && src->format == RingFrameFormat::Compressed;
-  float sigma = 0;
-  if constexpr (Stage != SegmentOp::Copy) {
-    auto& stats = reinterpret_cast<ncclKernelCommAndChannels*>(ncclShmem.args.comm)->zipStats;
-    SliceEstimate estimate{suppliedSigma, ncclZipStatSlices};
-    if (suppliedSigma < 0) estimate = sliceEstimate<Stage == SegmentOp::Encode>(prims, tid, stats, local, n);
-    sigma = estimate.sigma;
-    if constexpr (Stage == SegmentOp::Encode) {
-      if (estimate.slot < ncclZipStatSlices) {
-        ncclZipSums sums{};
-        int bytes;
-        if (n >= ncclZipMinSliceBytes / sizeof(uint16_t)) {
-          bytes = codec<SegmentOp::StatEncode>(prims, tid, workers, local, n, sigma, ncclZipWindow(sigma),
-                                               nullptr, dst, nullptr, &sums);
-        } else {
-          auto* payload = reinterpret_cast<uint16_t*>(dst + 1);
-          for (int i = tid; i < n; i += workers) {
-            uint16_t value = local[i];
-            payload[i] = value;
-            sums.add(__bfloat162float(__ushort_as_bfloat16(value)));
-          }
-          if (tid == 0) *dst = {unsigned(n), 1, 0, RingFrameFormat::Raw, sigma};
-          bytes = sizeof(RingFrameHeader) + n * sizeof(uint16_t);
-        }
-        float updated = publishStats(prims, tid, workers, stats, estimate.slot, sums.moments());
-        if (tid == 0) dst->sigma = updated;
-        return bytes;
-      }
+                   const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense, bool fixedSend = false) {
+  constexpr bool encode = Stage == SegmentOp::Encode;
+  constexpr bool finalCopy = Stage == SegmentOp::Copy;
+  Frame in = encode ? Frame::Raw : src->format;
+  Frame out = finalCopy || n < ncclZipMinSliceBytes / sizeof(uint16_t) ? Frame::Raw :
+              fixedSend ? Frame::Fixed : Frame::Compressed;
+  auto& stats = reinterpret_cast<ncclKernelCommAndChannels*>(ncclShmem.args.comm)->zipStats;
+  SliceEstimate estimate{suppliedSigma, ncclZipStatSlices};
+  if (!finalCopy && suppliedSigma < 0) estimate = sliceEstimate<encode>(prims, tid, stats, local, n);
+  float sigma = estimate.sigma;
+  if constexpr (Stage == SegmentOp::Dre) sigma = hypotf(src->sigma, sigma);
+  int base = out == Frame::Raw ? 0 : ncclZipWindow(sigma);
+  PayloadArgs args{local, encode ? nullptr : src + 1, finalCopy ? static_cast<void*>(dense) : dst + 1,
+                   n, encode ? 0 : src->base, base};
+  int bytes;
+  if constexpr (encode) {
+    if (estimate.slot < ncclZipStatSlices) {
+      ncclZipSums sums{};
+      bytes = dispatchOutput<false, true, Frame::Raw>(out, prims, tid, workers, args, &sums);
+      sigma = publishStats(prims, tid, workers, stats, estimate.slot, sums.moments());
+    } else {
+      bytes = dispatchOutput<false, false, Frame::Raw>(out, prims, tid, workers, args, nullptr);
     }
-    if constexpr (Stage == SegmentOp::Dre) sigma = hypotf(src->sigma, sigma);
-    if (Stage == SegmentOp::Encode ? n >= ncclZipMinSliceBytes / sizeof(uint16_t) : compressedInput) {
-      int base = ncclZipWindow(sigma);
-      return codec<Stage>(prims, tid, workers, local, n, sigma, base, src, dst, nullptr);
-    }
-    dense = reinterpret_cast<uint16_t*>(dst + 1);
-  }
-  if (compressedInput) {
-    codec<SegmentOp::Copy>(prims, tid, workers, local, n, 0, 0, src, nullptr, dense);
   } else {
-    for (int i = tid; i < n; i += workers) {
-      uint16_t value = local[i];
-      if constexpr (Stage != SegmentOp::Encode) {
-        const auto* incoming = reinterpret_cast<const uint16_t*>(src + 1);
-        value = __bfloat16_as_ushort(__hadd(__ushort_as_bfloat16(incoming[i]), __ushort_as_bfloat16(value)));
-      }
-      dense[i] = value;
-    }
+    if (in == Frame::Fixed)
+      bytes = dispatchOutput<true, false, Frame::Fixed>(out, prims, tid, workers, args, nullptr);
+    else if (in == Frame::Compressed)
+      bytes = dispatchOutput<true, false, Frame::Compressed>(out, prims, tid, workers, args, nullptr);
+    else
+      bytes = dispatchOutput<true, false, Frame::Raw>(out, prims, tid, workers, args, nullptr);
   }
-  if (Stage != SegmentOp::Copy && tid == 0) {
-    *dst = {unsigned(n), hop + 1, 0, RingFrameFormat::Raw, sigma};
-    return sizeof(RingFrameHeader) + n * sizeof(uint16_t);
+  if constexpr (!finalCopy) {
+    if (tid == 0) *dst = {unsigned(n), encode ? 1u : src->contributors + 1, uint16_t(base), out, sigma};
+    return sizeof(RingFrameHeader) + bytes;
   }
   return 0;
 }
@@ -239,7 +129,8 @@ struct ZipCclRingProcess {
     auto* dense = Stage == 2 ? static_cast<uint16_t*>(work->recvbuff) + outIx + begin : nullptr;
     constexpr SegmentOp op = Stage == 0 ? SegmentOp::Encode : Stage == 1 ? SegmentOp::Dre : SegmentOp::Copy;
     int bytes = run<op>(*prims, tid, workers, local, n, work->zipSigma, Stage ? static_cast<RingFrameHeader*>(srcs[0]) : nullptr,
-                        Stage == 2 ? nullptr : static_cast<RingFrameHeader*>(dsts[0]), dense);
+                        Stage == 2 ? nullptr : static_cast<RingFrameHeader*>(dsts[0]), dense,
+                        Stage != 2 && prims->zipFixedSend());
     if (Stage != 2 && tid == 0) sizes[0] = (bytes + 1)/2;
   }
 };

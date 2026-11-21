@@ -5,6 +5,7 @@
  * See LICENSE.txt for more license information
  *************************************************************************/
 
+#include "zipccl_p2p.h"
 #include "checks.h"
 #include "comm.h"
 #include "graph.h"
@@ -571,6 +572,7 @@ static ncclResult_t p2pSendConnect(struct ncclComm* comm, struct ncclConnect* co
     send->conn.buffs[NCCL_PROTO_SIMPLE] = resources->proxyInfo.ceDevBuff;
   } else {
     send->conn.tail = &remDevMem->tail;
+    if (send->connIndex == NCCL_CONN_ZIPCCL) send->conn.flags |= ncclZipFixedSlots;
     send->conn.head = &resources->sendDevMem->head;
     send->conn.ptrExchange = &resources->sendDevMem->ptrExchange;
     send->conn.redOpArgExchange = resources->sendDevMem->redOpArgExchange;
