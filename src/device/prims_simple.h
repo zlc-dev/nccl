@@ -321,6 +321,10 @@ public:
     int next = ncclShmem.channel.ring.next;
     return ncclShmem.channel.peers[next]->send[NCCL_CONN_ZIPCCL].flags & ncclZipFixedSlots;
   }
+  __device__ bool zipStageRecv() const {
+    int prev = ncclShmem.channel.ring.prev;
+    return ncclShmem.channel.peers[prev]->recv[NCCL_CONN_ZIPCCL].flags & ncclZipStageRecv;
+  }
   __device__ __forceinline__ void* codecScratch() {
     // The codec is collective over all process() workers, so every worker must
     // address the same scratch slot rather than its own warp's slot.

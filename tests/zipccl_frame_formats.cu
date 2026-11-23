@@ -15,7 +15,7 @@ struct Workers {
 template<SegmentOp Op>
 __global__ void processFrame(ncclKernelCommAndChannels* comm, uint16_t* local, int n,
                              RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense, Format target,
-                             const float* sigma = nullptr) {
+                             const float* sigma = nullptr, uint8_t* staged = nullptr, unsigned capacity = 0) {
   if (!threadIdx.x) {
     ncclShmem.args.comm = &comm->comm;
     ncclShmem.channelId = 0;
@@ -36,11 +36,14 @@ __global__ void processFrame(ncclKernelCommAndChannels* comm, uint16_t* local, i
     }
     if (!threadIdx.x) {
       if (target == Format::Raw && bytes != n * sizeof(uint16_t)) asm("trap;");
-      *dst = {unsigned(n), 1, uint16_t(base), target, .02f};
+      *dst = {unsigned(n), 1, uint16_t(base), target, .02f, unsigned(sizeof(RingFrameHeader) + bytes)};
     }
   } else {
+    const auto* incoming = staged ? ncclZipRing::stageFrame(workers, threadIdx.x, blockDim.x, src, staged, capacity)
+                                  : src;
+    if (staged && incoming == src) asm("trap;");
     ncclZipRing::run<Op>(workers, threadIdx.x, blockDim.x, local, n, sigma,
-                         src, dst, dense, target == Format::Fixed);
+                         incoming, dst, dense, target == Format::Fixed);
   }
 }
 
@@ -115,7 +118,11 @@ int main() {
   comm->zipOutlierSlots = allocate<uint8_t>(RingWorkspaceBytes(elements));
   auto* input = allocate<uint16_t>(3 * elements);
   auto* dense = allocate<uint16_t>(elements);
-  auto* src = reinterpret_cast<RingFrameHeader*>(allocate<uint8_t>(capacity));
+  RingFrameHeader *hostSrc, *src;
+  check(cudaHostAlloc(&hostSrc, capacity, cudaHostAllocMapped));
+  check(cudaHostGetDevicePointer(&src, hostSrc, 0));
+  uint8_t* staged;
+  check(cudaMalloc(&staged, capacity));
   auto* dst = reinterpret_cast<RingFrameHeader*>(allocate<uint8_t>(capacity));
   auto* sigma = allocate<float>(1);
   *sigma = .03f;
@@ -140,7 +147,8 @@ int main() {
             processFrame<SegmentOp::Encode><<<1, workers, scratch>>>(comm, input, n, nullptr, src, nullptr, incoming);
           }
           check(cudaMemset(dst, 0xa5, capacity));
-          processFrame<SegmentOp::Dre><<<1, workers, scratch>>>(comm, input + elements, n, src, dst, nullptr, outgoing, sigma);
+          processFrame<SegmentOp::Dre><<<1, workers, scratch>>>(
+              comm, input + elements, n, src, dst, nullptr, outgoing, sigma, staged, capacity);
           processFrame<SegmentOp::Copy><<<1, workers, scratch>>>(comm, input + 2*elements, n, dst, nullptr, dense, Format::Raw);
           check(cudaDeviceSynchronize());
           if (dst->format != outgoing || dst->contributors != 2) return 2;
@@ -167,5 +175,7 @@ int main() {
     }
   }
   check(cudaFree(sigma));
-  puts("PASS: 32-warp compaction, all nine frame transitions, BF16 results, sparse slot boundaries and device sigma");
+  check(cudaFree(staged));
+  check(cudaFreeHost(hostSrc));
+  puts("PASS: 32-warp compaction, all nine frame transitions with host staging, BF16 results, sparse slots and device sigma");
 }

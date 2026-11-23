@@ -520,6 +520,7 @@ struct alignas(16) ncclKernelCommAndChannels {
   struct ncclDevChannel channels[MAXCHANNELS];
   ncclZipStats zipStats;
   uint8_t* zipOutlierSlots; // One byte per BF16 element per logical channel.
+  uint8_t* zipRecvFrames; // One staging slot per channel when SHM staging is enabled.
 };
 
 enum ncclDevWorkStorageType : uint8_t {

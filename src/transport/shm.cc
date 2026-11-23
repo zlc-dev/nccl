@@ -10,6 +10,7 @@
 #include "shm.h"
 #include "transport.h"
 #include "compiler.h"
+#include "zipccl_p2p.h"
 
 #define SHM_PATH_MAX 128
 #define SHM_HANDLE_TYPE ncclCuMemHandleType
@@ -53,6 +54,7 @@ struct shmRequest {
 #define SHM_SEND_SIDE 1
 #define SHM_RECV_SIDE 2
 NCCL_PARAM(ShmDisable, "SHM_DISABLE", 0);
+NCCL_PARAM(ZipShmGpuStage, "ZIP_SHM_GPU_STAGE", 0);
 NCCL_PARAM(ShmLocality, "SHM_LOCALITY", SHM_RECV_SIDE); // 1 is sender-size, 2 is receiver-size
 static int shmLocality = 0;
 static void initShmLocality();
@@ -193,6 +195,8 @@ static ncclResult_t shmRecvConnect(struct ncclComm* comm, struct ncclConnect* co
   recv->conn.head = &resources->devRemHostMem->head;
   recv->conn.tail = &resources->devHostMem->tail;
   recv->conn.stepSize = ncclConnBuffSize(recv->connIndex, NCCL_PROTO_SIMPLE, comm->buffSizes[NCCL_PROTO_SIMPLE]) / NCCL_STEPS;
+  if (recv->connIndex == NCCL_CONN_ZIPCCL && ncclParamZipShmGpuStage())
+    recv->conn.flags |= ncclZipStageRecv;
 
   // We must assign the proxyConn's proxyProgress property for proper checking at enqueue-time
   recv->proxyConn.proxyProgress = shmTransport.recv.proxyProgress;

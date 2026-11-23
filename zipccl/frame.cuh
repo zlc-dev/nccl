@@ -33,6 +33,7 @@ struct alignas(kRingFrameAlignment) RingFrameHeader {
   uint16_t base;
   RingFrameFormat format;
   float sigma;
+  uint32_t frameBytes;
 };
 static_assert(sizeof(RingFrameHeader) == kRingFrameAlignment, "Ring payload must start on a transaction boundary");
 

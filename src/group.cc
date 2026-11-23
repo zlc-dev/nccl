@@ -7,6 +7,7 @@
 
 #include "group.h"
 #include "../zipccl/frame.cuh"
+#include "zipccl_p2p.h"
 #include "debug.h"
 #include "enqueue.h"
 #include "enqueue/task_sched.h"
@@ -283,6 +284,12 @@ ncclResult_t ncclCollPreconnect(struct ncclComm* comm, bool* algoNeedConnect) {
       NCCLCHECK(ncclTransportP2pConnect(comm, c, 1, &ring->prev, 1, &ring->next, NCCL_CONN_ZIPCCL));
     }
     NCCLCHECK(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_RING], NCCL_CONN_ZIPCCL));
+    bool stageRecv = false;
+    for (int c = 0; c < comm->nChannels; ++c) {
+      auto& channel = comm->channels[c];
+      const auto& recv = channel.peers[channel.ring.prev]->recv[NCCL_CONN_ZIPCCL];
+      stageRecv |= (recv.conn.flags & ncclZipStageRecv) != 0;
+    }
     uint8_t* slots;
     constexpr size_t elements = ncclZipRawSliceBytes / sizeof(uint16_t);
     static_assert(elements % zipccl::kElementsPerBlock == 0, "Ring workspace must hold whole blocks");
@@ -291,6 +298,13 @@ ncclResult_t ncclCollPreconnect(struct ncclComm* comm, bool* algoNeedConnect) {
     ncclCommPushCudaFree(comm, slots);
     auto* device = reinterpret_cast<ncclKernelCommAndChannels*>(comm->devComm);
     NCCLCHECK(ncclCudaMemcpy(&device->zipOutlierSlots, &slots, 1));
+    if (stageRecv) {
+      constexpr size_t frameCapacity = ncclZipStepBytes * REDUCESCATTER_SLICESTEPS;
+      uint8_t* frames;
+      NCCLCHECK(ncclCudaMalloc(&frames, size_t(comm->nChannels) * frameCapacity, comm->memManager));
+      ncclCommPushCudaFree(comm, frames);
+      NCCLCHECK(ncclCudaMemcpy(&device->zipRecvFrames, &frames, 1));
+    }
     comm->zipRingConnected = true;
   }
   return ncclSuccess;

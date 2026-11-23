@@ -64,6 +64,27 @@ __device__ SliceEstimate sliceEstimate(P& prims, int tid, ncclZipStats& stats, c
 
 using Frame = RingFrameFormat;
 
+template<class P>
+__device__ const RingFrameHeader* stageFrame(P& prims, int tid, int workers,
+                                             const RingFrameHeader* src, uint8_t* dst, unsigned capacity) {
+  auto* sharedBytes = static_cast<unsigned*>(prims.codecScratch());
+  if (tid == 0) *sharedBytes = src->frameBytes;
+  prims.syncCodecWorkers();
+  unsigned bytes = *sharedBytes;
+  if (bytes < sizeof(RingFrameHeader) || bytes > capacity) {
+    prims.syncCodecWorkers();
+    return src;
+  }
+  auto* source = reinterpret_cast<const uint8_t*>(src);
+  unsigned vectors = bytes / sizeof(uint4);
+  for (unsigned i = tid; i < vectors; i += workers)
+    reinterpret_cast<uint4*>(dst)[i] = reinterpret_cast<const uint4*>(source)[i];
+  for (unsigned i = vectors * sizeof(uint4) + tid; i < bytes; i += workers)
+    dst[i] = source[i];
+  prims.syncCodecWorkers();
+  return reinterpret_cast<const RingFrameHeader*>(dst);
+}
+
 template<bool Reduce, bool Statistics, Frame In, class P>
 __device__ int dispatchOutput(Frame out, P& p, int tid, int workers, const PayloadArgs& args, ncclZipSums* sums) {
   if (out == Frame::Fixed) return processPayload<Reduce, Statistics, In, Frame::Fixed>(p, tid, workers, args, sums);
@@ -112,8 +133,9 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
       bytes = dispatchOutput<true, false, Frame::Raw>(out, prims, tid, workers, args, nullptr);
   }
   if constexpr (!finalCopy) {
-    if (tid == 0) *dst = {unsigned(n), encode ? 1u : src->contributors + 1, uint16_t(base), out, sigma};
-    return sizeof(RingFrameHeader) + bytes;
+    unsigned frameBytes = sizeof(RingFrameHeader) + bytes;
+    if (tid == 0) *dst = {unsigned(n), encode ? 1u : src->contributors + 1, uint16_t(base), out, sigma, frameBytes};
+    return frameBytes;
   }
   return 0;
 }
@@ -126,7 +148,7 @@ struct ZipCclRingProcess {
   intptr_t inpIx, outIx;
   int eltN;
   template<int Slices, int, int, int, int, int, int>
-  __device__ void operator()(int tid, int workers, int slice, int, int nSrcs, void** srcs,
+  __device__ void operator()(int tid, int workers, int slice, int fifoElements, int nSrcs, void** srcs,
                              int nDsts, void** dsts, int32_t* sizes, uint32_t, uint32_t) {
     using namespace ncclZipRing;
     // Use the Simple slice partition in units of original BF16 elements.
@@ -137,8 +159,18 @@ struct ZipCclRingProcess {
     if ((Stage != 0 && !nSrcs) || (Stage != 2 && !nDsts)) return;
     const auto* local = static_cast<const uint16_t*>(work->sendbuff) + inpIx + begin;
     auto* dense = Stage == 2 ? static_cast<uint16_t*>(work->recvbuff) + outIx + begin : nullptr;
+    const RingFrameHeader* src = nullptr;
+    if constexpr (Stage != 0) {
+      src = static_cast<const RingFrameHeader*>(srcs[0]);
+      if (prims->zipStageRecv()) {
+        unsigned capacity = fifoElements * sizeof(uint16_t);
+        auto* comm = reinterpret_cast<const ncclKernelCommAndChannels*>(ncclShmem.args.comm);
+        auto* staged = comm->zipRecvFrames + size_t(ncclShmem.channelId) * capacity;
+        src = stageFrame(*prims, tid, workers, src, staged, capacity);
+      }
+    }
     constexpr SegmentOp op = Stage == 0 ? SegmentOp::Encode : Stage == 1 ? SegmentOp::Dre : SegmentOp::Copy;
-    int bytes = run<op>(*prims, tid, workers, local, n, work->zipSigma, Stage ? static_cast<RingFrameHeader*>(srcs[0]) : nullptr,
+    int bytes = run<op>(*prims, tid, workers, local, n, work->zipSigma, src,
                         Stage == 2 ? nullptr : static_cast<RingFrameHeader*>(dsts[0]), dense,
                         Stage != 2 && prims->zipFixedSend());
     if (Stage != 2 && tid == 0) sizes[0] = (bytes + 1)/2;
