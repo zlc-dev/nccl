@@ -72,7 +72,7 @@ __device__ int dispatchOutput(Frame out, P& p, int tid, int workers, const Paylo
 }
 
 template<SegmentOp Stage, class P>
-__device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n, float suppliedSigma,
+__device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n, const float* suppliedSigma,
                    const RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense, bool fixedSend = false) {
   constexpr bool encode = Stage == SegmentOp::Encode;
   constexpr bool finalCopy = Stage == SegmentOp::Copy;
@@ -80,8 +80,15 @@ __device__ int run(P& prims, int tid, int workers, const uint16_t* local, int n,
   Frame out = finalCopy || n < ncclZipMinSliceBytes / sizeof(uint16_t) ? Frame::Raw :
               fixedSend ? Frame::Fixed : Frame::Compressed;
   auto& stats = reinterpret_cast<ncclKernelCommAndChannels*>(ncclShmem.args.comm)->zipStats;
-  SliceEstimate estimate{suppliedSigma, ncclZipStatSlices};
-  if (!finalCopy && suppliedSigma < 0) estimate = sliceEstimate<encode>(prims, tid, stats, local, n);
+  SliceEstimate estimate{0.0f, ncclZipStatSlices};
+  if constexpr (!finalCopy) {
+    if (suppliedSigma) {
+      float sigma = *suppliedSigma;
+      estimate.sigma = isfinite(sigma) && sigma >= 0.0f ? sigma : 0.0f;
+    } else {
+      estimate = sliceEstimate<encode>(prims, tid, stats, local, n);
+    }
+  }
   float sigma = estimate.sigma;
   if constexpr (Stage == SegmentOp::Dre) sigma = hypotf(src->sigma, sigma);
   int base = out == Frame::Raw ? 0 : ncclZipWindow(sigma);

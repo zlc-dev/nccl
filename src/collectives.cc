@@ -7,7 +7,6 @@
 
 #include "argcheck.h" // Need some checks here since we access comm
 #include "collectives.h"
-#include <cmath>
 #include "config/collconfig.h"
 #include "enqueue.h"
 #include "nccl.h"
@@ -351,7 +350,6 @@ NCCL_API(ncclResult_t, ncclZipCCLReduceScatterWithSigma, const void* sendbuff, v
 ncclResult_t ncclZipCCLReduceScatterWithSigma(const void* sendbuff, void* recvbuff, size_t recvcount,
                                              ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm,
                                              cudaStream_t stream, const float* sigma) {
-  if (sigma && (!std::isfinite(*sigma) || *sigma < 0)) return ncclInvalidArgument;
   if (datatype != ncclBfloat16 || op != ncclSum) return ncclInvalidArgument;
   int ranks;
   NCCLCHECK(ncclCommCount(comm, &ranks));
@@ -367,7 +365,7 @@ ncclResult_t ncclZipCCLReduceScatterWithSigma(const void* sendbuff, void* recvbu
   config.forceAlgSelection = 1;
   NCCLCHECK(ncclParseCollConfig(&config, &info.collConfig));
   info.zipccl = true;
-  info.zipSigma = sigma ? *sigma : -1.0f;
+  info.zipSigma = sigma;
   return ncclEnqueueCheck(&info);
 }
 

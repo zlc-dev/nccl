@@ -622,7 +622,11 @@ ncclResult_t pncclReduceScatter(const void* sendbuff, void* recvbuff,
     size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
     cudaStream_t stream);
 
-/* Rank-local input standard deviation, copied from host at call time. NULL selects device measurement. */
+/*
+ * sigma points to a rank-local float in device memory. Its value must be ready
+ * in stream order, and the storage and value must remain valid until completion.
+ * NULL selects device measurement. Negative or non-finite values are treated as zero.
+ */
 ncclResult_t  ncclZipCCLReduceScatterWithSigma(const void* sendbuff, void* recvbuff,
     size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
     cudaStream_t stream, const float* sigma);

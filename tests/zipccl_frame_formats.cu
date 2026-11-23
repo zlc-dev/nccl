@@ -14,7 +14,8 @@ struct Workers {
 
 template<SegmentOp Op>
 __global__ void processFrame(ncclKernelCommAndChannels* comm, uint16_t* local, int n,
-                             RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense, Format target) {
+                             RingFrameHeader* src, RingFrameHeader* dst, uint16_t* dense, Format target,
+                             const float* sigma = nullptr) {
   if (!threadIdx.x) {
     ncclShmem.args.comm = &comm->comm;
     ncclShmem.channelId = 0;
@@ -38,7 +39,7 @@ __global__ void processFrame(ncclKernelCommAndChannels* comm, uint16_t* local, i
       *dst = {unsigned(n), 1, uint16_t(base), target, .02f};
     }
   } else {
-    ncclZipRing::run<Op>(workers, threadIdx.x, blockDim.x, local, n, .02f,
+    ncclZipRing::run<Op>(workers, threadIdx.x, blockDim.x, local, n, sigma,
                          src, dst, dense, target == Format::Fixed);
   }
 }
@@ -116,6 +117,8 @@ int main() {
   auto* dense = allocate<uint16_t>(elements);
   auto* src = reinterpret_cast<RingFrameHeader*>(allocate<uint8_t>(capacity));
   auto* dst = reinterpret_cast<RingFrameHeader*>(allocate<uint8_t>(capacity));
+  auto* sigma = allocate<float>(1);
+  *sigma = .03f;
   check(cudaFuncSetAttribute(processFrame<SegmentOp::Encode>, cudaFuncAttributeMaxDynamicSharedMemorySize, scratch));
   check(cudaFuncSetAttribute(processFrame<SegmentOp::StatEncode>, cudaFuncAttributeMaxDynamicSharedMemorySize, scratch));
   check(cudaFuncSetAttribute(processFrame<SegmentOp::Dre>, cudaFuncAttributeMaxDynamicSharedMemorySize, scratch));
@@ -137,10 +140,11 @@ int main() {
             processFrame<SegmentOp::Encode><<<1, workers, scratch>>>(comm, input, n, nullptr, src, nullptr, incoming);
           }
           check(cudaMemset(dst, 0xa5, capacity));
-          processFrame<SegmentOp::Dre><<<1, workers, scratch>>>(comm, input + elements, n, src, dst, nullptr, outgoing);
+          processFrame<SegmentOp::Dre><<<1, workers, scratch>>>(comm, input + elements, n, src, dst, nullptr, outgoing, sigma);
           processFrame<SegmentOp::Copy><<<1, workers, scratch>>>(comm, input + 2*elements, n, dst, nullptr, dense, Format::Raw);
           check(cudaDeviceSynchronize());
           if (dst->format != outgoing || dst->contributors != 2) return 2;
+          if (fabsf(dst->sigma - hypotf(.02f, *sigma)) > 1e-7f) return 7;
           int used = 0;
           for (int i = 0; i < n; ++i) {
             auto sum = __float2bfloat16(float(__ushort_as_bfloat16(input[i])) + float(__ushort_as_bfloat16(input[elements+i])));
@@ -162,5 +166,6 @@ int main() {
       }
     }
   }
-  puts("PASS: 32-warp compaction, all nine frame transitions, BF16 results and sparse slot boundaries");
+  check(cudaFree(sigma));
+  puts("PASS: 32-warp compaction, all nine frame transitions, BF16 results, sparse slot boundaries and device sigma");
 }

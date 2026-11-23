@@ -1931,7 +1931,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   const auto* task = ncclIntruQueueHead(&plan->collTaskQueue);
   if (task && task->zipccl)
     smem = std::max(smem, zipccl::device::RingDreScratchBytes(ncclZipWorkerWarps));
-  if (task && task->zipccl && task->zipSigma < 0) {
+  if (task && task->zipccl && !task->zipSigma) {
     if (task->next) return ncclInternalError;
     auto* workspace = &reinterpret_cast<ncclKernelCommAndChannels*>(comm->devComm)->zipStats;
     CUDACHECK(cudaMemsetAsync(workspace, 0, sizeof(*workspace), launchStream));

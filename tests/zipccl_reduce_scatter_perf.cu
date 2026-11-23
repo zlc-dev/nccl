@@ -121,7 +121,8 @@ __device__ float4 sample(unsigned long long seed, int rank, size_t packet) {
 __device__ float component(float4 v, int lane) {
   return lane < 2 ? (lane ? v.y : v.x) : (lane == 2 ? v.z : v.w);
 }
-__global__ void generate(BF* data, size_t count, unsigned long long seed, int rank, float sigma) {
+__global__ void generate(BF* data, size_t count, unsigned long long seed, int rank, float sigma, float* deviceSigma) {
+  if (deviceSigma && blockIdx.x == 0 && threadIdx.x == 0) *deviceSigma = sigma;
   for (size_t i = size_t(blockIdx.x * blockDim.x + threadIdx.x)*4; i < count;
        i += size_t(gridDim.x)*blockDim.x*4) {
     float4 v = sample(seed, rank, i/4);
@@ -169,6 +170,7 @@ struct Rank {
   ncclComm_t comm;
   cudaStream_t stream;
   BF *send, *recv;
+  float* sigma;
   unsigned long long* errors;
 };
 
@@ -180,7 +182,7 @@ void collective(std::vector<Rank>& ranks, size_t count, const Options& o) {
     if (o.native)
       CHECK(ncclReduceScatter(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream));
     else
-      CHECK(ncclZipCCLReduceScatterWithSigma(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream, o.supplySigma ? &o.sigma : nullptr));
+      CHECK(ncclZipCCLReduceScatterWithSigma(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream, p.sigma));
   }
   CHECK(ncclGroupEnd());
 }
@@ -211,7 +213,8 @@ int run(const Options& o) {
     CHECK(cudaMalloc(&p.send, maxCount*o.gpus*sizeof(BF)));
     CHECK(cudaMalloc(&p.recv, maxCount*sizeof(BF)));
     CHECK(cudaMalloc(&p.errors, sizeof(*p.errors)));
-    generate<<<256,256,0,p.stream>>>(p.send,maxCount*o.gpus,o.seed,r,o.sigma);
+    if (!o.native && o.supplySigma) CHECK(cudaMalloc(&p.sigma, sizeof(*p.sigma)));
+    generate<<<256,256,0,p.stream>>>(p.send,maxCount*o.gpus,o.seed,r,o.sigma,p.sigma);
     CHECK(cudaGetLastError());
   }
   sync(ranks);
@@ -258,6 +261,7 @@ int run(const Options& o) {
     CHECK(cudaSetDevice(r));
     auto& p = ranks[r];
     CHECK(ncclCommDestroy(p.comm));
+    if (p.sigma) CHECK(cudaFree(p.sigma));
     CHECK(cudaFree(p.errors)); CHECK(cudaFree(p.recv)); CHECK(cudaFree(p.send));
     CHECK(cudaStreamDestroy(p.stream));
   }
