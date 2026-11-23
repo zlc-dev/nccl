@@ -129,8 +129,11 @@ struct ZipCclRingProcess {
   __device__ void operator()(int tid, int workers, int slice, int, int nSrcs, void** srcs,
                              int nDsts, void** dsts, int32_t* sizes, uint32_t, uint32_t) {
     using namespace ncclZipRing;
-    int begin = int(int64_t(eltN)*slice/Slices);
-    int n = int(int64_t(eltN)*(slice+1)/Slices) - begin;
+    // Use the Simple slice partition in units of original BF16 elements.
+    constexpr int rawSliceElements = ncclZipRawSliceBytes / sizeof(uint16_t);
+    int sliceSize = max(divUp(eltN, 16 * Slices) * 16, rawSliceElements / 32);
+    int begin = min(eltN, slice * sliceSize);
+    int n = min(sliceSize, eltN - begin);
     if ((Stage != 0 && !nSrcs) || (Stage != 2 && !nDsts)) return;
     const auto* local = static_cast<const uint16_t*>(work->sendbuff) + inpIx + begin;
     auto* dense = Stage == 2 ? static_cast<uint16_t*>(work->recvbuff) + outIx + begin : nullptr;

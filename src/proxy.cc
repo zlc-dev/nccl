@@ -598,7 +598,7 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
   case ncclPatternPipelineFrom:
   case ncclPatternPipelineTo:
     {
-      struct ncclRing* ring = op->zipccl ? &comm->channels[comm->zipSourceChannel(op->channelId)].ring : &channel->ring;
+      struct ncclRing* ring = &channel->ring;
       needProxy = NeedProxy(proxyRecv, op->pattern, op->root, ring, comm->nRanks);
       if (op->coll == ncclFuncAllGatherV && op->pattern == ncclPatternRing) {
         op->nsteps = op->specifics.bcast.recvSlices;
@@ -1151,7 +1151,6 @@ static ncclResult_t ncclProxyFreeConnections(struct ncclProxyConnectionPool* poo
 #include "transport.h"
 
 struct ncclProxyInitReq {
-  bool skipProgress;
   int transport;
   int send;
   int tpLocalRank;
@@ -1215,8 +1214,6 @@ ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, in
   }
 
   struct ncclProxyInitReq req = {0};
-  // Ordinary SHM and direct ZipCCL receives need no progress thread or op pool.
-  req.skipProgress = transport == TRANSPORT_SHM && !send && proxyConn->proxyProgress == nullptr;
   req.transport = transport;
   req.send = send;
   req.tpLocalRank = comm->topParentLocalRanks[comm->localRank];
@@ -1231,7 +1228,7 @@ ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, in
 
   // If we need proxy progress, map progress ops
   struct ncclTransportComm* tcomm = send ? &ncclTransports[transport]->send : &ncclTransports[transport]->recv;
-  if (!req.skipProgress && tcomm->proxyProgress) {
+  if (tcomm->proxyProgress) {
 #if defined(NCCL_OS_LINUX)
     char poolPath[sizeof("/dev/shm/nccl-XXXXXX")];
     snprintf(poolPath, sizeof(poolPath), "/dev/shm/nccl-%.6s", resp.devShmPath);
@@ -1573,7 +1570,7 @@ static ncclResult_t proxyConnInit(struct ncclProxyLocalPeer* peer, struct ncclPr
   (*connection)->tcomm = (*connection)->send ? &ncclTransports[(*connection)->transport]->send :
                                                &ncclTransports[(*connection)->transport]->recv;
   // If we need proxy progress, let's allocate ops and start the thread
-  if (!req->skipProgress && (*connection)->tcomm->proxyProgress) {
+  if ((*connection)->tcomm->proxyProgress) {
     NCCLCHECK(proxyProgressInit(proxyState));
     struct ncclProxyProgressState* state = &proxyState->progressState;
     memcpy(resp->devShmPath, state->opsPoolShmSuffix, sizeof(resp->devShmPath));

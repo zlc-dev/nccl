@@ -13,8 +13,7 @@
 namespace {
 template <typename T, typename RedOp, typename Proto>
 __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
-  const ncclRing* ring = work->zipccl ? &ncclShmem.comm.channels[ncclShmem.channel.zipSourceChannel].ring :
-                                          &ncclShmem.channel.ring;
+  const ncclRing* ring = &ncclShmem.channel.ring;
   int const* ringRanks = ring->userRanks;
   const int nranks = ncclShmem.comm.nRanks;
   size_t count;
@@ -112,11 +111,6 @@ template <typename T, typename RedOp>
 struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     using Proto = ProtoSimple<REDUCESCATTER_CHUNKSTEPS / REDUCESCATTER_SLICESTEPS, REDUCESCATTER_SLICESTEPS>;
-    if (work->zipccl) {
-      using ZipProto = ProtoSimple<1, REDUCESCATTER_CHUNKSTEPS>;
-      runRing<T, RedOp, ZipProto>(tid, nthreads, work);
-      return;
-    }
     runRing<T, RedOp, Proto>(tid, nthreads, work);
   }
 };

@@ -11,7 +11,6 @@
 #include "transport.h"
 #include "trees.h"
 #include "rings.h"
-#include "zipccl_channels.h"
 #include "topo.h"
 
 /******************************************************************/
@@ -521,16 +520,6 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
 
   // Create rings array and check all is fine
   NCCLCHECKGOTO(ncclBuildRings(nChannels, rings, comm->rank, comm->nRanks, ringPrev, ringNext), ret, fail);
-  comm->zipRingCount = ncclZipDistinctRings(rings, comm->collChannels, nranks, comm->zipRingSources);
-  comm->zipChannelCapacity = std::min({ncclMaxNchannels(), comm->config.maxCTAs,
-                                        std::max(comm->config.minCTAs, ncclZipMaxChannelsPerRing * comm->zipRingCount)});
-  if (parent && comm->sharedRes->owner != comm) {
-    // A sharing child can reuse only peer tables provisioned by its parent.
-    int parentChannels = std::max(parent->nChannels, parent->zipChannelCapacity);
-    comm->zipChannelCapacity = std::min(comm->zipChannelCapacity, parentChannels);
-  }
-  INFO(NCCL_GRAPH, "ZipCCL: %d distinct directed rings, capacity %d channels",
-       comm->zipRingCount, comm->zipChannelCapacity);
 
 exit:
   if (ringRecv) free(ringRecv);

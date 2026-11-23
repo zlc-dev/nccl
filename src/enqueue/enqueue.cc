@@ -6,7 +6,6 @@
  *************************************************************************/
 
 #include "../../zipccl/frame.cuh"
-#include "zipccl_channels.h"
 #include "enqueue.h"
 #include "argcheck.h"
 #include "coll_net.h"
@@ -686,13 +685,6 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
       // We would have task->minCTAs=8 and task->maxCTAs=4.
       task->nMaxChannels = std::max<int>(task->nMaxChannels, task->minCTAs);
       task->nMaxChannels = std::min<int>(task->nMaxChannels, task->maxCTAs);
-      if (task->zipccl) {
-        int limit = std::min(comm->zipChannelCapacity, task->maxCTAs);
-        limit = std::min<size_t>(limit, task->count / (ncclZipMinSliceBytes / sizeof(uint16_t)));
-        int target = ncclZipChannelCount(task->count, ncclZipTargetSliceBytes / sizeof(uint16_t), comm->zipRingCount, limit);
-        target = std::min<size_t>(target, std::max<size_t>(1, task->count / (ncclZipTargetSliceBytes / sizeof(uint16_t))));
-        task->nMaxChannels = std::min(limit, std::max(target, task->minCTAs));
-      }
       // nvlsCTAs has no comm default (UNDEF == no cap), so it is applied only when resolved to a value.
       if (task->isNvls && task->nvlsCTAs != NCCL_CONFIG_UNDEF_INT)
         task->nMaxChannels = std::min<int>(task->nMaxChannels, task->nvlsCTAs);
@@ -800,19 +792,7 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
       size_t countHi = cellsHi * elementsPerCell;
       (countHi != 0 ? countHi : countLo) -= cells * elementsPerCell - task->count;
 
-      if (task->zipccl) {
-        // ZipCCL is isolated in its own plan. Partition its rank-local result
-        // across exactly the selected connectors, including the final tail.
-        int channels = std::min<size_t>(task->count, int(task->nMaxChannels));
-        channelId = 0;
-        size_t count = task->count / channels;
-        if (count >= 8) count -= count % 8; // 16-byte BF16 tiles
-        nMidChannels = std::max(0, channels - 2);
-        countMid = nMidChannels ? count : 0;
-        countLo = channels == 1 ? task->count : count;
-        countHi = channels == 1 ? 0 : task->count - countLo - nMidChannels * count;
-      }
-      nChannels = (countLo != 0 ? 1 : 0) + nMidChannels + (countHi != 0 ? 1 : 0);
+      nChannels = (countLo != 0 ? 1 : 0) + nMidChannels + (cellsHi != 0 ? 1 : 0);
 
       // Update number of channels propagated to the profiler
       task->nChannels = (uint8_t)nChannels;
@@ -2304,12 +2284,23 @@ static ncclResult_t calcCollChunking(struct ncclComm* comm, struct ncclTaskColl*
 
   int nstepsPerLoop, nchunksPerLoop;
   size_t loopOffset = 0;
-  int stepSize = info->zipccl ? ncclZipStepBytes : comm->buffSizes[info->protocol] / NCCL_STEPS;
+  int stepSize = comm->buffSizes[info->protocol] / NCCL_STEPS;
   int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
   int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
   int chunkSize = stepSize * chunkSteps;
   if (info->protocol == NCCL_PROTO_LL) chunkSize /= 2;
   if (info->protocol == NCCL_PROTO_LL128) chunkSize = (chunkSize / NCCL_LL128_LINEELEMS) * NCCL_LL128_DATAELEMS;
+  if (info->zipccl) {
+    if (info->algorithm != NCCL_ALGO_RING || info->protocol != NCCL_PROTO_SIMPLE) return ncclInvalidUsage;
+    constexpr size_t elements = ncclZipRawSliceBytes / sizeof(uint16_t);
+    static_assert(ncclZipStepBytes % zipccl::device::kRingFrameAlignment == 0 &&
+                  sizeof(ncclSendMem) % zipccl::device::kRingFrameAlignment == 0 &&
+                  sizeof(ncclRecvMem) % zipccl::device::kRingFrameAlignment == 0, "Unaligned ZipCCL FIFO");
+    static_assert(sizeof(zipccl::device::RingFrameHeader) +
+                      zipccl::device::FrameLayout(elements, zipccl::device::kRingFrameAlignment).capacity <=
+                      ncclZipStepBytes * REDUCESCATTER_SLICESTEPS, "ZipCCL frame exceeds FIFO slice capacity");
+    chunkSize = ncclZipRawSliceBytes * (REDUCESCATTER_CHUNKSTEPS / REDUCESCATTER_SLICESTEPS);
+  }
   // Buffer-based ceiling; plugins may increase chunk size up to this limit.
   int bufferMaxChunkSize = chunkSize;
 
@@ -2412,17 +2403,7 @@ static ncclResult_t calcCollChunking(struct ncclComm* comm, struct ncclTaskColl*
 
   // Compute nSteps for proxies
   chunkSize = chunkSize / grainSize * grainSize; // align chunkSize to multiple grainSize
-  if (info->zipccl) {
-    if (info->algorithm != NCCL_ALGO_RING || info->protocol != NCCL_PROTO_SIMPLE) return ncclInvalidUsage;
-    constexpr size_t elements = ncclZipRawSliceBytes / sizeof(uint16_t);
-    static_assert(ncclZipStepBytes % zipccl::device::kRingFrameAlignment == 0 &&
-                  sizeof(ncclSendMem) % zipccl::device::kRingFrameAlignment == 0 &&
-                  sizeof(ncclRecvMem) % zipccl::device::kRingFrameAlignment == 0, "Unaligned ZipCCL P2P FIFO");
-    static_assert(sizeof(zipccl::device::RingFrameHeader) +
-                      zipccl::device::FrameLayout(elements, zipccl::device::kRingFrameAlignment).capacity <=
-                      ncclZipStepBytes * REDUCESCATTER_CHUNKSTEPS, "ZipCCL slice exceeds FIFO capacity");
-    chunkSize = ncclZipRawSliceBytes;
-  }
+  if (info->zipccl && chunkSize == 0) return ncclInvalidUsage;
   switch (pattern) {
   case ncclPatternTreeUp:
   case ncclPatternTreeDown:

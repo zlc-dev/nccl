@@ -278,18 +278,15 @@ ncclResult_t ncclCollPreconnect(struct ncclComm* comm, bool* algoNeedConnect) {
     }
   }
   if (algoNeedConnect[ncclZipRingConnectSlot] && !comm->zipRingConnected) {
-    for (int c = 0; c < comm->zipChannelCapacity; ++c) {
-      int source = comm->zipSourceChannel(c);
-      ncclRing* ring = &comm->channels[source].ring;
-      if (comm->rank == 0)
-        INFO(NCCL_GRAPH, "ZipCCL channel %d uses ring from topology channel %d", c, source);
+    for (int c = 0; c < comm->nChannels; ++c) {
+      ncclRing* ring = &comm->channels[c].ring;
       NCCLCHECK(ncclTransportP2pConnect(comm, c, 1, &ring->prev, 1, &ring->next, NCCL_CONN_ZIPCCL));
     }
     NCCLCHECK(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_RING], NCCL_CONN_ZIPCCL));
     uint8_t* slots;
     constexpr size_t elements = ncclZipRawSliceBytes / sizeof(uint16_t);
     static_assert(elements % zipccl::kElementsPerBlock == 0, "Ring workspace must hold whole blocks");
-    NCCLCHECK(ncclCudaMalloc(&slots, size_t(comm->zipChannelCapacity) * zipccl::device::RingWorkspaceBytes(elements),
+    NCCLCHECK(ncclCudaMalloc(&slots, size_t(comm->nChannels) * zipccl::device::RingWorkspaceBytes(elements),
                              comm->memManager));
     ncclCommPushCudaFree(comm, slots);
     auto* device = reinterpret_cast<ncclKernelCommAndChannels*>(comm->devComm);

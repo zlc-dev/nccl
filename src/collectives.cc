@@ -359,7 +359,7 @@ ncclResult_t ncclZipCCLReduceScatterWithSigma(const void* sendbuff, void* recvbu
   if (recvcount < minRecvCount || recvcount < ncclZipMinSliceBytes / sizeof(uint16_t))
     return ncclReduceScatter(sendbuff, recvbuff, recvcount, datatype, op, comm, stream);
   ncclInfo info = {ncclFuncReduceScatter, "ZipCCLReduceScatter", sendbuff, recvbuff, recvcount, datatype, op,
-                   0, comm, stream, REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_CHUNKSTEPS};
+                   0, comm, stream, REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS};
   ncclCollConfig_t config = NCCL_COLLCONFIG_INITIALIZER;
   config.algSelection = "RING_SIMPLE";
   config.forceAlgSelection = 1;

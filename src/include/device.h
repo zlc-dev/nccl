@@ -236,8 +236,7 @@ struct ncclNvls {
 #define NCCL_CONN_ZIPCCL 2
 #define NCCL_MAX_CONNS 3
 constexpr int ncclZipMinSliceBytes = 512 << 10;
-constexpr int ncclZipTargetSliceBytes = 1 << 20;
-constexpr int ncclZipRawSliceBytes = 2 << 20;
+constexpr int ncclZipRawSliceBytes = 1 << 20;
 constexpr int ncclZipWorkerWarps = 19;
 constexpr int ncclZipTotalWarps = ncclZipWorkerWarps + 1;
 static_assert(ncclZipTotalWarps * WARP_SIZE <= NCCL_MAX_NTHREADS, "ZipCCL CTA exceeds thread limit");
@@ -444,7 +443,6 @@ struct ncclDevChannelPeer {
 };
 
 struct alignas(16) ncclDevChannel {
-  int zipSourceChannel;
   struct ncclDevChannelPeer** peers;
   struct ncclRing ring;
   struct ncclTree tree;

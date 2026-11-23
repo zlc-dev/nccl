@@ -827,7 +827,6 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   }
 
   for (int c = 0; c < MAXCHANNELS; c++) {
-    if (c < comm->zipChannelCapacity) tmpCommAndChans.channels[c].zipSourceChannel = comm->zipSourceChannel(c);
     tmpCommAndChans.channels[c].peers = comm->channels[c].devPeers;
     tmpCommAndChans.channels[c].ring = comm->channels[c].ring;
     tmpCommAndChans.channels[c].ring.userRanks = comm->channels[c].devRingUserRanks;
@@ -1809,9 +1808,6 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     comm->planner.rmaTaskQueues = NULL;
   }
 
-  for (int c = comm->nChannels; c < comm->zipChannelCapacity; ++c) {
-    NCCLCHECKGOTO(initChannel(comm, c), ret, fail);
-  }
   comm->runtimeConn = comm->cuMemSupport && ncclParamRuntimeConnect();
   if (comm->runtimeConn) {
     for (int c = 0; c < comm->nChannels; c++) {

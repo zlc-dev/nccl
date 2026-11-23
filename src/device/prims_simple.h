@@ -318,7 +318,7 @@ public:
     subBarrier();
   }
   __device__ bool zipFixedSend() const {
-    int next = ncclShmem.comm.channels[ncclShmem.channel.zipSourceChannel].ring.next;
+    int next = ncclShmem.channel.ring.next;
     return ncclShmem.channel.peers[next]->send[NCCL_CONN_ZIPCCL].flags & ncclZipFixedSlots;
   }
   __device__ __forceinline__ void* codecScratch() {
