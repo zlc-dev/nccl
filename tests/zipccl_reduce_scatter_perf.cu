@@ -34,6 +34,8 @@ void check(ncclResult_t e, const char* call) {
 }
 #define CHECK(call) check((call), #call)
 
+enum class Mix { None, Separate, Grouped };
+
 struct Options {
   size_t begin = 1 << 20, end = 64 << 20;
   int gpus = 4, factor = 2, warmup = 5, iterations = 20, validate = 1;
@@ -41,13 +43,17 @@ struct Options {
   float sigma = 0.02f;
   bool native = false;
   bool supplySigma = false;
+  bool allOutliers = false;
   bool multiProcess = false;
+  Mix mix = Mix::None;
 };
 
 void usage() {
   puts("zipccl_reduce_scatter_perf [-g GPUs] [-b minBytes] [-e maxBytes] [-f factor]\n"
        "  [-w warmups] [-n iterations] [-c 0|1] [--sigma stddev] [--seed integer] [--native] [--multi-process]\n"
+       "  [--mix separate|grouped] alternates AllGather and ReduceScatter on the same stream.\n"
        "Without --sigma, generate inputs at sigma=0.02 and let ZipCCL estimate it.\n"
+       "--all-outliers uses positive BF16 inputs and supplies device sigma=0 to ZipCCL.\n"
        "Sizes are total uncompressed send bytes per GPU. K/M/G use powers of 1024.\n"
        "Each GPU receives size / GPUs bytes. BF16 Sum, out-of-place.\n"
        "--multi-process launches one process per GPU on the local node.");
@@ -77,13 +83,18 @@ Options parse(int argc, char** argv) {
     std::string key = argv[i];
     if (key == "-h" || key == "--help") { usage(); std::exit(0); }
     if (key == "--native") { o.native = true; continue; }
+    if (key == "--all-outliers") { o.allOutliers = true; continue; }
     if (key == "--multi-process") { o.multiProcess = true; continue; }
     if (++i == argc) throw std::invalid_argument("missing value for " + key);
     std::string val = argv[i];
     if (key == "-b") o.begin = number(val, true);
     else if (key == "-e") o.end = number(val, true);
     else if (key == "--seed") o.seed = number(val);
-    else if (key == "--sigma") {
+    else if (key == "--mix") {
+      if (val == "separate") o.mix = Mix::Separate;
+      else if (val == "grouped") o.mix = Mix::Grouped;
+      else throw std::invalid_argument("--mix must be separate or grouped");
+    } else if (key == "--sigma") {
       size_t used;
       o.sigma = std::stof(val, &used);
       o.supplySigma = true;
@@ -103,6 +114,10 @@ Options parse(int argc, char** argv) {
   if (o.gpus < 1 || o.begin < sizeof(BF)*o.gpus || o.end < o.begin ||
       o.factor < 2 || !o.iterations || o.validate > 1)
     throw std::invalid_argument("invalid size range, GPU count, factor, iteration count or check mode");
+  if (o.mix == Mix::Separate && !o.multiProcess)
+    throw std::invalid_argument("--mix separate requires --multi-process");
+  if (o.allOutliers && o.supplySigma)
+    throw std::invalid_argument("--all-outliers sets the device sigma and cannot be combined with --sigma");
   return o;
 }
 
@@ -123,7 +138,11 @@ __device__ float2 normalPair(uint64_t bits) {
   float radius = sqrtf(-2.0f * logf(u));
   return make_float2(radius * cosine, radius * sine);
 }
-__device__ float4 sample(unsigned long long seed, int rank, size_t packet) {
+__device__ float4 sample(unsigned long long seed, int rank, size_t packet, bool allOutliers) {
+  if (allOutliers) {
+    if ((packet ^ unsigned(rank)) & 1) return make_float4(2, 1, 2, 1);
+    return make_float4(1, 2, 1, 2);
+  }
   uint64_t key = mix(seed + rank);
   float2 a = normalPair(mix(key + 2*packet));
   float2 b = normalPair(mix(key + 2*packet + 1));
@@ -132,18 +151,30 @@ __device__ float4 sample(unsigned long long seed, int rank, size_t packet) {
 __device__ float component(float4 v, int lane) {
   return lane < 2 ? (lane ? v.y : v.x) : (lane == 2 ? v.z : v.w);
 }
-__global__ void generate(BF* data, size_t count, unsigned long long seed, int rank, float sigma, float* deviceSigma) {
-  if (deviceSigma && blockIdx.x == 0 && threadIdx.x == 0) *deviceSigma = sigma;
+__global__ void generate(BF* data, size_t count, unsigned long long seed, int rank, float scale,
+                         bool allOutliers, float* deviceSigma) {
+  if (deviceSigma && blockIdx.x == 0 && threadIdx.x == 0) *deviceSigma = allOutliers ? 0.0f : scale;
   for (size_t i = size_t(blockIdx.x * blockDim.x + threadIdx.x)*4; i < count;
        i += size_t(gridDim.x)*blockDim.x*4) {
-    float4 v = sample(seed, rank, i/4);
-    for (int j = 0; j < 4 && i+j < count; ++j) data[i+j] = __float2bfloat16_rn(sigma * component(v,j));
+    float4 v = sample(seed, rank, i/4, allOutliers);
+    for (int j = 0; j < 4 && i+j < count; ++j) data[i+j] = __float2bfloat16_rn(scale * component(v,j));
   }
 }
 __device__ float addBF(float a, float b) { return __bfloat162float(__float2bfloat16_rn(a+b)); }
 
-__global__ void verify(const BF* output, size_t count, int dest, int ranks, float sigma,
-                       unsigned long long seed, unsigned long long* errors) {
+__global__ void verifyGather(const BF* output, size_t count, int ranks, float scale,
+                             unsigned long long seed, bool allOutliers, unsigned long long* errors) {
+  unsigned long long localErrors = 0;
+  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count * ranks; i += size_t(blockDim.x)*gridDim.x) {
+    size_t index = i % count;
+    BF expected = __float2bfloat16_rn(scale * component(sample(seed, i / count, index / 4, allOutliers), int(index % 4)));
+    localErrors += __bfloat16_as_ushort(output[i]) != __bfloat16_as_ushort(expected);
+  }
+  if (localErrors) atomicAdd(errors, localErrors);
+}
+
+__global__ void verify(const BF* output, size_t count, int dest, int ranks, float scale,
+                       unsigned long long seed, bool allOutliers, unsigned long long* errors) {
   unsigned long long localErrors = 0;
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += size_t(blockDim.x)*gridDim.x) {
     size_t index = size_t(dest)*count + i;
@@ -152,7 +183,7 @@ __global__ void verify(const BF* output, size_t count, int dest, int ranks, floa
     double sum = 0, magnitude = 0;
     for (int r = 0; r < ranks; ++r) {
       float x = __bfloat162float(__float2bfloat16_rn(
-          sigma * component(sample(seed, r, index/4), int(index%4))));
+          scale * component(sample(seed, r, index/4, allOutliers), int(index%4))));
       sum += x;
       magnitude += fabs(double(x));
       if (r == dest) last = x;
@@ -161,7 +192,8 @@ __global__ void verify(const BF* output, size_t count, int dest, int ranks, floa
     float got = __bfloat162float(output[i]);
     // Every directed Ring finishes with the destination rank's own summand.
     bool ok;
-    if (ranks == 1) ok = got == last;
+    if (allOutliers && ranks <= 128) ok = got == sum; // All positive integer partial sums fit exactly in BF16.
+    else if (ranks == 1) ok = got == last;
     else if (ranks == 2) ok = got == addBF(others[0], last);
     else if (ranks == 3) ok = got == addBF(addBF(others[0], others[1]), last);
     else if (ranks == 4) {
@@ -181,6 +213,7 @@ struct Rank {
   ncclComm_t comm;
   cudaStream_t stream;
   BF *send, *recv;
+  BF* gathered;
   float* sigma;
   unsigned long long* errors;
 };
@@ -203,18 +236,28 @@ struct SharedRun {
 };
 
 void collective(std::vector<Rank>& ranks, size_t count, const Options& o, int processRank, bool trace = false) {
-  if (processRank < 0) CHECK(ncclGroupStart());
+  const bool grouped = processRank < 0 || o.mix == Mix::Grouped;
+  if (grouped) CHECK(ncclGroupStart());
   for (int r = 0; r < int(ranks.size()); ++r) {
     CHECK(cudaSetDevice(processRank < 0 ? r : processRank));
     auto& p = ranks[r];
     if (trace) fprintf(stderr, "# rank %d first collective start, recvcount=%zu\n", processRank, count);
+    if (o.mix != Mix::None) {
+      ncclResult_t result = ncclAllGather(p.send, p.gathered, count, ncclBfloat16, p.comm, p.stream);
+      if (trace) fprintf(stderr, "# rank %d AllGather API returned %d\n", processRank, int(result));
+      check(result, "ncclAllGather");
+    }
     ncclResult_t result = o.native ?
         ncclReduceScatter(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream) :
         ncclZipCCLReduceScatterWithSigma(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream, p.sigma);
-    if (trace) fprintf(stderr, "# rank %d first collective API returned %d, recvcount=%zu\n", processRank, int(result), count);
+    if (trace) fprintf(stderr, "# rank %d ReduceScatter API returned %d, recvcount=%zu\n", processRank, int(result), count);
     check(result, o.native ? "ncclReduceScatter" : "ncclZipCCLReduceScatterWithSigma");
   }
-  if (processRank < 0) CHECK(ncclGroupEnd());
+  if (grouped) {
+    ncclResult_t result = ncclGroupEnd();
+    if (trace) fprintf(stderr, "# rank %d ncclGroupEnd returned %d\n", processRank, int(result));
+    check(result, "ncclGroupEnd");
+  }
 }
 
 void sync(const std::vector<Rank>& ranks, int processRank) {
@@ -226,6 +269,7 @@ void sync(const std::vector<Rank>& ranks, int processRank) {
 
 int run(const Options& o, int processRank = -1, SharedRun* shared = nullptr) {
   const bool report = processRank <= 0;
+  const float scale = o.allOutliers ? 1.0f : o.sigma;
   const int localRanks = shared ? 1 : o.gpus;
   int available;
   CHECK(cudaGetDeviceCount(&available));
@@ -254,15 +298,25 @@ int run(const Options& o, int processRank = -1, SharedRun* shared = nullptr) {
     CHECK(cudaMalloc(&p.send, maxCount*o.gpus*sizeof(BF)));
     CHECK(cudaMalloc(&p.recv, maxCount*sizeof(BF)));
     CHECK(cudaMalloc(&p.errors, sizeof(*p.errors)));
-    if (!o.native && o.supplySigma) CHECK(cudaMalloc(&p.sigma, sizeof(*p.sigma)));
-    generate<<<256,256,0,p.stream>>>(p.send,maxCount*o.gpus,o.seed,rank,o.sigma,p.sigma);
+    if (o.mix != Mix::None) CHECK(cudaMalloc(&p.gathered, maxCount*o.gpus*sizeof(BF)));
+    if (!o.native && (o.supplySigma || o.allOutliers)) CHECK(cudaMalloc(&p.sigma, sizeof(*p.sigma)));
+    generate<<<256,256,0,p.stream>>>(p.send,maxCount*o.gpus,o.seed,rank,scale,o.allOutliers,p.sigma);
     CHECK(cudaGetLastError());
   }
   sync(ranks, processRank);
   if (report) {
-    printf("# %s BF16 Sum  out-of-place  sigma=%g seed=%llu warmup=%d iterations=%d\n",
-           o.native ? "ncclReduceScatter" : "ZipCCLReduceScatter",o.sigma,o.seed,o.warmup,o.iterations);
-    if (!o.native) puts(o.supplySigma ? "# sigma supplied" : "# sigma estimated by StatEncode");
+    printf("# %s BF16 Sum  out-of-place  warmup=%d iterations=%d\n",
+           o.native ? "ncclReduceScatter" : "ZipCCLReduceScatter",o.warmup,o.iterations);
+    if (o.allOutliers) puts(o.native ? "# inputs: BF16 1 and 2" : "# inputs: BF16 1 and 2, device sigma=0");
+    else {
+      printf("# Gaussian inputs sigma=%g seed=%llu\n", o.sigma, o.seed);
+      if (!o.native) puts(o.supplySigma ? "# sigma supplied" : "# sigma estimated by StatEncode");
+    }
+    if (o.mix != Mix::None) {
+      printf("# AllGather + ReduceScatter on the same stream, %s\n",
+             o.mix == Mix::Grouped ? "one NCCL group" : "separate submissions");
+      puts("# bandwidth uses the ReduceScatter payload and the full pair duration");
+    }
     puts("# send_bytes/GPU  recv_count/GPU  time_us  algbw_GB/s  busbw_GB/s  wrong");
     fflush(stdout);
   }
@@ -294,8 +348,12 @@ int run(const Options& o, int processRank = -1, SharedRun* shared = nullptr) {
         int rank = shared ? processRank : r;
         CHECK(cudaSetDevice(rank));
         CHECK(cudaMemsetAsync(p.errors, 0, sizeof(*p.errors), p.stream));
-        verify<<<256,256,0,p.stream>>>(p.recv,count,rank,o.gpus,o.sigma,o.seed,p.errors);
+        verify<<<256,256,0,p.stream>>>(p.recv,count,rank,o.gpus,scale,o.seed,o.allOutliers,p.errors);
         CHECK(cudaGetLastError());
+        if (p.gathered) {
+          verifyGather<<<256,256,0,p.stream>>>(p.gathered,count,o.gpus,scale,o.seed,o.allOutliers,p.errors);
+          CHECK(cudaGetLastError());
+        }
       }
       sync(ranks, processRank);
       for (int r = 0; r < localRanks; ++r) {
@@ -331,6 +389,7 @@ int run(const Options& o, int processRank = -1, SharedRun* shared = nullptr) {
     CHECK(cudaSetDevice(shared ? processRank : r));
     auto& p = ranks[r];
     CHECK(ncclCommDestroy(p.comm));
+    if (p.gathered) CHECK(cudaFree(p.gathered));
     if (p.sigma) CHECK(cudaFree(p.sigma));
     CHECK(cudaFree(p.errors)); CHECK(cudaFree(p.recv)); CHECK(cudaFree(p.send));
     CHECK(cudaStreamDestroy(p.stream));
