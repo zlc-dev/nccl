@@ -11,9 +11,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <pthread.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 using BF = __nv_bfloat16;
@@ -33,14 +41,16 @@ struct Options {
   float sigma = 0.02f;
   bool native = false;
   bool supplySigma = false;
+  bool multiProcess = false;
 };
 
 void usage() {
   puts("zipccl_reduce_scatter_perf [-g GPUs] [-b minBytes] [-e maxBytes] [-f factor]\n"
-       "  [-w warmups] [-n iterations] [-c 0|1] [--sigma stddev] [--seed integer] [--native]\n"
+       "  [-w warmups] [-n iterations] [-c 0|1] [--sigma stddev] [--seed integer] [--native] [--multi-process]\n"
        "Without --sigma, generate inputs at sigma=0.02 and let ZipCCL estimate it.\n"
        "Sizes are total uncompressed send bytes per GPU. K/M/G use powers of 1024.\n"
-       "Each GPU receives size / GPUs bytes. BF16 Sum, out-of-place, one process.");
+       "Each GPU receives size / GPUs bytes. BF16 Sum, out-of-place.\n"
+       "--multi-process launches one process per GPU on the local node.");
 }
 
 unsigned long long number(const std::string& s, bool sizes = false) {
@@ -67,6 +77,7 @@ Options parse(int argc, char** argv) {
     std::string key = argv[i];
     if (key == "-h" || key == "--help") { usage(); std::exit(0); }
     if (key == "--native") { o.native = true; continue; }
+    if (key == "--multi-process") { o.multiProcess = true; continue; }
     if (++i == argc) throw std::invalid_argument("missing value for " + key);
     std::string val = argv[i];
     if (key == "-b") o.begin = number(val, true);
@@ -174,91 +185,150 @@ struct Rank {
   unsigned long long* errors;
 };
 
-void collective(std::vector<Rank>& ranks, size_t count, const Options& o) {
-  CHECK(ncclGroupStart());
-  for (int r = 0; r < int(ranks.size()); ++r) {
-    CHECK(cudaSetDevice(r));
-    auto& p = ranks[r];
-    if (o.native)
-      CHECK(ncclReduceScatter(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream));
-    else
-      CHECK(ncclZipCCLReduceScatterWithSigma(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream, p.sigma));
+struct RankResult {
+  double seconds;
+  unsigned long long wrong;
+};
+
+struct SharedRun {
+  pthread_barrier_t barrier;
+  ncclUniqueId id;
+  RankResult* results;
+
+  void wait() {
+    int result = pthread_barrier_wait(&barrier);
+    if (result != 0 && result != PTHREAD_BARRIER_SERIAL_THREAD)
+      throw std::runtime_error(std::string("pthread_barrier_wait: ") + std::strerror(result));
   }
-  CHECK(ncclGroupEnd());
+};
+
+void collective(std::vector<Rank>& ranks, size_t count, const Options& o, int processRank, bool trace = false) {
+  if (processRank < 0) CHECK(ncclGroupStart());
+  for (int r = 0; r < int(ranks.size()); ++r) {
+    CHECK(cudaSetDevice(processRank < 0 ? r : processRank));
+    auto& p = ranks[r];
+    if (trace) fprintf(stderr, "# rank %d first collective start, recvcount=%zu\n", processRank, count);
+    ncclResult_t result = o.native ?
+        ncclReduceScatter(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream) :
+        ncclZipCCLReduceScatterWithSigma(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream, p.sigma);
+    if (trace) fprintf(stderr, "# rank %d first collective API returned %d, recvcount=%zu\n", processRank, int(result), count);
+    check(result, o.native ? "ncclReduceScatter" : "ncclZipCCLReduceScatterWithSigma");
+  }
+  if (processRank < 0) CHECK(ncclGroupEnd());
 }
 
-void sync(const std::vector<Rank>& ranks) {
+void sync(const std::vector<Rank>& ranks, int processRank) {
   for (int r = 0; r < int(ranks.size()); ++r) {
-    CHECK(cudaSetDevice(r));
+    CHECK(cudaSetDevice(processRank < 0 ? r : processRank));
     CHECK(cudaStreamSynchronize(ranks[r].stream));
   }
 }
 
-int run(const Options& o) {
+int run(const Options& o, int processRank = -1, SharedRun* shared = nullptr) {
+  const bool report = processRank <= 0;
+  const int localRanks = shared ? 1 : o.gpus;
   int available;
   CHECK(cudaGetDeviceCount(&available));
   if (o.gpus > available) throw std::runtime_error("requested more GPUs than are visible");
   size_t maxCount = o.end / sizeof(BF) / o.gpus;
-  std::vector<ncclComm_t> comms(o.gpus);
-  CHECK(ncclCommInitAll(comms.data(), o.gpus, nullptr));
-  std::vector<Rank> ranks(o.gpus);
-  for (int r = 0; r < o.gpus; ++r) {
-    CHECK(cudaSetDevice(r));
+  std::vector<ncclComm_t> comms(localRanks);
+  if (shared) {
+    CHECK(cudaSetDevice(processRank));
+    if (processRank == 0) CHECK(ncclGetUniqueId(&shared->id));
+    shared->wait();
+    CHECK(ncclCommInitRank(&comms[0], o.gpus, shared->id, processRank));
+  } else {
+    CHECK(ncclCommInitAll(comms.data(), o.gpus, nullptr));
+  }
+  std::vector<Rank> ranks(localRanks);
+  for (int r = 0; r < localRanks; ++r) {
+    int rank = shared ? processRank : r;
+    CHECK(cudaSetDevice(rank));
     auto& p = ranks[r];
     p.comm = comms[r];
     cudaDeviceProp prop{};
-    CHECK(cudaGetDeviceProperties(&prop, r));
-    printf("# rank %d  device %d  %s\n", r, r, prop.name);
+    CHECK(cudaGetDeviceProperties(&prop, rank));
+    printf("# rank %d  device %d  %s\n", rank, rank, prop.name);
+    fflush(stdout);
     CHECK(cudaStreamCreateWithFlags(&p.stream, cudaStreamNonBlocking));
     CHECK(cudaMalloc(&p.send, maxCount*o.gpus*sizeof(BF)));
     CHECK(cudaMalloc(&p.recv, maxCount*sizeof(BF)));
     CHECK(cudaMalloc(&p.errors, sizeof(*p.errors)));
     if (!o.native && o.supplySigma) CHECK(cudaMalloc(&p.sigma, sizeof(*p.sigma)));
-    generate<<<256,256,0,p.stream>>>(p.send,maxCount*o.gpus,o.seed,r,o.sigma,p.sigma);
+    generate<<<256,256,0,p.stream>>>(p.send,maxCount*o.gpus,o.seed,rank,o.sigma,p.sigma);
     CHECK(cudaGetLastError());
   }
-  sync(ranks);
-  printf("# %s BF16 Sum  out-of-place  sigma=%g seed=%llu warmup=%d iterations=%d\n",
-         o.native ? "ncclReduceScatter" : "ZipCCLReduceScatter",o.sigma,o.seed,o.warmup,o.iterations);
-  if (!o.native) puts(o.supplySigma ? "# sigma supplied" : "# sigma estimated by StatEncode");
-  puts("# send_bytes/GPU  recv_count/GPU  time_us  algbw_GB/s  busbw_GB/s  wrong");
+  sync(ranks, processRank);
+  if (report) {
+    printf("# %s BF16 Sum  out-of-place  sigma=%g seed=%llu warmup=%d iterations=%d\n",
+           o.native ? "ncclReduceScatter" : "ZipCCLReduceScatter",o.sigma,o.seed,o.warmup,o.iterations);
+    if (!o.native) puts(o.supplySigma ? "# sigma supplied" : "# sigma estimated by StatEncode");
+    puts("# send_bytes/GPU  recv_count/GPU  time_us  algbw_GB/s  busbw_GB/s  wrong");
+    fflush(stdout);
+  }
   bool passed = true;
   for (size_t requested = o.begin;;) {
     size_t count = requested / sizeof(BF) / o.gpus;
     size_t bytes = count * sizeof(BF) * o.gpus;
-    for (int w = 0; w < o.warmup; ++w) collective(ranks, count, o);
-    sync(ranks);
+    for (int w = 0; w < o.warmup; ++w) {
+      bool trace = shared && w == 0;
+      collective(ranks, count, o, processRank, trace);
+      if (trace) {
+        sync(ranks, processRank);
+        fprintf(stderr, "# rank %d first collective complete, recvcount=%zu\n", processRank, count);
+      }
+    }
+    sync(ranks, processRank);
+    if (shared) shared->wait();
     auto start = std::chrono::steady_clock::now();
-    for (int n = 0; n < o.iterations; ++n) collective(ranks, count, o);
-    sync(ranks);
+    for (int n = 0; n < o.iterations; ++n)
+      collective(ranks, count, o, processRank, shared && o.warmup == 0 && n == 0);
+    sync(ranks, processRank);
     double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()/o.iterations;
-    double alg = double(bytes)/seconds/1e9;
-    printf("%16zu %15zu %9.2f %11.3f %11.3f ", bytes, count, seconds*1e6, alg, alg*(o.gpus-1)/o.gpus);
+    if (shared && o.warmup == 0)
+      fprintf(stderr, "# rank %d timed collectives complete, recvcount=%zu\n", processRank, count);
+    unsigned long long wrong = 0;
     if (o.validate) {
-      unsigned long long wrong = 0;
-      for (int r = 0; r < o.gpus; ++r) {
+      for (int r = 0; r < localRanks; ++r) {
         auto& p = ranks[r];
-        CHECK(cudaSetDevice(r));
+        int rank = shared ? processRank : r;
+        CHECK(cudaSetDevice(rank));
         CHECK(cudaMemsetAsync(p.errors, 0, sizeof(*p.errors), p.stream));
-        verify<<<256,256,0,p.stream>>>(p.recv,count,r,o.gpus,o.sigma,o.seed,p.errors);
+        verify<<<256,256,0,p.stream>>>(p.recv,count,rank,o.gpus,o.sigma,o.seed,p.errors);
         CHECK(cudaGetLastError());
       }
-      sync(ranks);
-      for (int r = 0; r < o.gpus; ++r) {
+      sync(ranks, processRank);
+      for (int r = 0; r < localRanks; ++r) {
         unsigned long long value;
-        CHECK(cudaSetDevice(r));
+        CHECK(cudaSetDevice(shared ? processRank : r));
         CHECK(cudaMemcpy(&value,ranks[r].errors,sizeof(value),cudaMemcpyDeviceToHost));
         wrong += value;
       }
-      printf("%llu\n",wrong);
+    }
+    if (shared) {
+      shared->results[processRank] = {seconds, wrong};
+      shared->wait();
+      if (report) {
+        wrong = 0;
+        for (int r = 0; r < o.gpus; ++r) {
+          seconds = std::max(seconds, shared->results[r].seconds);
+          wrong += shared->results[r].wrong;
+        }
+      }
+    }
+    if (report) {
+      double alg = double(bytes)/seconds/1e9;
+      printf("%16zu %15zu %9.2f %11.3f %11.3f ", bytes, count, seconds*1e6, alg, alg*(o.gpus-1)/o.gpus);
+      if (o.validate) printf("%llu\n", wrong);
+      else puts("off");
       passed &= wrong == 0;
-    } else puts("off");
-    fflush(stdout);
+      fflush(stdout);
+    }
     if (requested > o.end / o.factor) break;
     requested *= o.factor;
   }
-  for (int r = 0; r < o.gpus; ++r) {
-    CHECK(cudaSetDevice(r));
+  for (int r = 0; r < localRanks; ++r) {
+    CHECK(cudaSetDevice(shared ? processRank : r));
     auto& p = ranks[r];
     CHECK(ncclCommDestroy(p.comm));
     if (p.sigma) CHECK(cudaFree(p.sigma));
@@ -267,9 +337,87 @@ int run(const Options& o) {
   }
   return passed ? 0 : 2;
 }
+
+int runProcesses(const Options& o) {
+  std::vector<pid_t> children;
+  children.reserve(o.gpus);
+  size_t bytes = sizeof(SharedRun) + size_t(o.gpus) * sizeof(RankResult);
+  void* mapping = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED) throw std::runtime_error(std::string("mmap: ") + std::strerror(errno));
+  auto* shared = new (mapping) SharedRun{};
+  shared->results = new (shared + 1) RankResult[o.gpus]{};
+  pthread_barrierattr_t attr;
+  int error = pthread_barrierattr_init(&attr);
+  if (!error) {
+    error = pthread_barrierattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+    if (!error) error = pthread_barrier_init(&shared->barrier, &attr, o.gpus);
+    pthread_barrierattr_destroy(&attr);
+  }
+  if (error) {
+    munmap(mapping, bytes);
+    throw std::runtime_error(std::string("initializing process barrier: ") + std::strerror(error));
+  }
+
+  // The parent only launches and reaps children. CUDA is initialized inside each rank.
+  const pid_t parent = getpid();
+  int result = 0;
+  for (int rank = 0; rank < o.gpus; ++rank) {
+    pid_t child = fork();
+    if (child == 0) {
+      if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent) _exit(1);
+      try {
+        _exit(run(o, rank, shared));
+      } catch (const std::exception& e) {
+        fprintf(stderr, "rank %d: %s\n", rank, e.what());
+        _exit(1);
+      }
+    }
+    if (child < 0) {
+      fprintf(stderr, "fork: %s\n", std::strerror(errno));
+      result = 1;
+      break;
+    }
+    children.push_back(child);
+  }
+
+  while (result != 1 && !children.empty()) {
+    int status;
+    pid_t child = waitpid(-1, &status, 0);
+    if (child < 0) {
+      if (errno == EINTR) continue;
+      fprintf(stderr, "waitpid: %s\n", std::strerror(errno));
+      result = 1;
+      break;
+    }
+    auto it = std::find(children.begin(), children.end(), child);
+    if (it == children.end()) continue;
+    children.erase(it);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 2) {
+      result = 2;
+    } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      fprintf(stderr, "benchmark worker %ld failed\n", static_cast<long>(child));
+      result = 1;
+    }
+  }
+  if (result == 1) {
+    for (pid_t child : children) kill(child, SIGKILL);
+    for (pid_t child : children) {
+      while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
+    }
+  } else {
+    pthread_barrier_destroy(&shared->barrier);
+  }
+  munmap(mapping, bytes);
+  return result;
+}
 } // namespace
 
 int main(int argc, char** argv) {
-  try { return run(parse(argc,argv)); }
-  catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
+  try {
+    auto options = parse(argc, argv);
+    return options.multiProcess ? runProcesses(options) : run(options);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "error: %s\n", e.what());
+    return 1;
+  }
 }
