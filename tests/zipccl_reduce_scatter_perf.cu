@@ -44,19 +44,18 @@ struct Options {
   bool native = false;
   bool supplySigma = false;
   bool allOutliers = false;
-  bool multiProcess = false;
   Mix mix = Mix::None;
 };
 
 void usage() {
   puts("zipccl_reduce_scatter_perf [-g GPUs] [-b minBytes] [-e maxBytes] [-f factor]\n"
-       "  [-w warmups] [-n iterations] [-c 0|1] [--sigma stddev] [--seed integer] [--native] [--multi-process]\n"
+       "  [-w warmups] [-n iterations] [-c 0|1] [--sigma stddev] [--seed integer] [--native]\n"
        "  [--mix separate|grouped] alternates AllGather and ReduceScatter on the same stream.\n"
        "Without --sigma, generate inputs at sigma=0.02 and let ZipCCL estimate it.\n"
        "--all-outliers uses positive BF16 inputs and supplies device sigma=0 to ZipCCL.\n"
        "Sizes are total uncompressed send bytes per GPU. K/M/G use powers of 1024.\n"
        "Each GPU receives size / GPUs bytes. BF16 Sum, out-of-place.\n"
-       "--multi-process launches one process per GPU on the local node.");
+       "Launches one process per GPU on the local node.");
 }
 
 unsigned long long number(const std::string& s, bool sizes = false) {
@@ -84,7 +83,8 @@ Options parse(int argc, char** argv) {
     if (key == "-h" || key == "--help") { usage(); std::exit(0); }
     if (key == "--native") { o.native = true; continue; }
     if (key == "--all-outliers") { o.allOutliers = true; continue; }
-    if (key == "--multi-process") { o.multiProcess = true; continue; }
+    // Accept the old flag in existing benchmark commands.
+    if (key == "--multi-process") continue;
     if (++i == argc) throw std::invalid_argument("missing value for " + key);
     std::string val = argv[i];
     if (key == "-b") o.begin = number(val, true);
@@ -114,8 +114,6 @@ Options parse(int argc, char** argv) {
   if (o.gpus < 1 || o.begin < sizeof(BF)*o.gpus || o.end < o.begin ||
       o.factor < 2 || !o.iterations || o.validate > 1)
     throw std::invalid_argument("invalid size range, GPU count, factor, iteration count or check mode");
-  if (o.mix == Mix::Separate && !o.multiProcess)
-    throw std::invalid_argument("--mix separate requires --multi-process");
   if (o.allOutliers && o.supplySigma)
     throw std::invalid_argument("--all-outliers sets the device sigma and cannot be combined with --sigma");
   return o;
@@ -235,148 +233,86 @@ struct SharedRun {
   }
 };
 
-void collective(std::vector<Rank>& ranks, size_t count, const Options& o, int processRank, bool trace = false) {
-  const bool grouped = processRank < 0 || o.mix == Mix::Grouped;
-  if (grouped) CHECK(ncclGroupStart());
-  for (int r = 0; r < int(ranks.size()); ++r) {
-    CHECK(cudaSetDevice(processRank < 0 ? r : processRank));
-    auto& p = ranks[r];
-    if (trace) fprintf(stderr, "# rank %d first collective start, recvcount=%zu\n", processRank, count);
-    if (o.mix != Mix::None) {
-      ncclResult_t result = ncclAllGather(p.send, p.gathered, count, ncclBfloat16, p.comm, p.stream);
-      if (trace) fprintf(stderr, "# rank %d AllGather API returned %d\n", processRank, int(result));
-      check(result, "ncclAllGather");
-    }
-    ncclResult_t result = o.native ?
-        ncclReduceScatter(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream) :
-        ncclZipCCLReduceScatterWithSigma(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream, p.sigma);
-    if (trace) fprintf(stderr, "# rank %d ReduceScatter API returned %d, recvcount=%zu\n", processRank, int(result), count);
-    check(result, o.native ? "ncclReduceScatter" : "ncclZipCCLReduceScatterWithSigma");
-  }
-  if (grouped) {
-    ncclResult_t result = ncclGroupEnd();
-    if (trace) fprintf(stderr, "# rank %d ncclGroupEnd returned %d\n", processRank, int(result));
-    check(result, "ncclGroupEnd");
-  }
+void collective(const Rank& p, size_t count, const Options& o) {
+  if (o.mix == Mix::Grouped) CHECK(ncclGroupStart());
+  if (o.mix != Mix::None)
+    CHECK(ncclAllGather(p.send, p.gathered, count, ncclBfloat16, p.comm, p.stream));
+  if (o.native)
+    CHECK(ncclReduceScatter(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream));
+  else
+    CHECK(ncclZipCCLReduceScatterWithSigma(p.send, p.recv, count, ncclBfloat16, ncclSum, p.comm, p.stream, p.sigma));
+  if (o.mix == Mix::Grouped) CHECK(ncclGroupEnd());
 }
 
-void sync(const std::vector<Rank>& ranks, int processRank) {
-  for (int r = 0; r < int(ranks.size()); ++r) {
-    CHECK(cudaSetDevice(processRank < 0 ? r : processRank));
-    CHECK(cudaStreamSynchronize(ranks[r].stream));
-  }
-}
-
-int run(const Options& o, int processRank = -1, SharedRun* shared = nullptr) {
-  const bool report = processRank <= 0;
+int runRank(const Options& o, int rank, SharedRun& shared) {
   const float scale = o.allOutliers ? 1.0f : o.sigma;
-  const int localRanks = shared ? 1 : o.gpus;
   int available;
   CHECK(cudaGetDeviceCount(&available));
   if (o.gpus > available) throw std::runtime_error("requested more GPUs than are visible");
+
+  CHECK(cudaSetDevice(rank));
+  if (rank == 0) CHECK(ncclGetUniqueId(&shared.id));
+  shared.wait();
+  Rank p{};
+  CHECK(ncclCommInitRank(&p.comm, o.gpus, shared.id, rank));
+
   size_t maxCount = o.end / sizeof(BF) / o.gpus;
-  std::vector<ncclComm_t> comms(localRanks);
-  if (shared) {
-    CHECK(cudaSetDevice(processRank));
-    if (processRank == 0) CHECK(ncclGetUniqueId(&shared->id));
-    shared->wait();
-    CHECK(ncclCommInitRank(&comms[0], o.gpus, shared->id, processRank));
-  } else {
-    CHECK(ncclCommInitAll(comms.data(), o.gpus, nullptr));
-  }
-  std::vector<Rank> ranks(localRanks);
-  for (int r = 0; r < localRanks; ++r) {
-    int rank = shared ? processRank : r;
-    CHECK(cudaSetDevice(rank));
-    auto& p = ranks[r];
-    p.comm = comms[r];
-    cudaDeviceProp prop{};
-    CHECK(cudaGetDeviceProperties(&prop, rank));
-    printf("# rank %d  device %d  %s\n", rank, rank, prop.name);
-    fflush(stdout);
-    CHECK(cudaStreamCreateWithFlags(&p.stream, cudaStreamNonBlocking));
-    CHECK(cudaMalloc(&p.send, maxCount*o.gpus*sizeof(BF)));
-    CHECK(cudaMalloc(&p.recv, maxCount*sizeof(BF)));
-    CHECK(cudaMalloc(&p.errors, sizeof(*p.errors)));
-    if (o.mix != Mix::None) CHECK(cudaMalloc(&p.gathered, maxCount*o.gpus*sizeof(BF)));
-    if (!o.native && (o.supplySigma || o.allOutliers)) CHECK(cudaMalloc(&p.sigma, sizeof(*p.sigma)));
-    generate<<<256,256,0,p.stream>>>(p.send,maxCount*o.gpus,o.seed,rank,scale,o.allOutliers,p.sigma);
-    CHECK(cudaGetLastError());
-  }
-  sync(ranks, processRank);
-  if (report) {
-    printf("# %s BF16 Sum  out-of-place  warmup=%d iterations=%d\n",
-           o.native ? "ncclReduceScatter" : "ZipCCLReduceScatter",o.warmup,o.iterations);
-    if (o.allOutliers) puts(o.native ? "# inputs: BF16 1 and 2" : "# inputs: BF16 1 and 2, device sigma=0");
-    else {
-      printf("# Gaussian inputs sigma=%g seed=%llu\n", o.sigma, o.seed);
-      if (!o.native) puts(o.supplySigma ? "# sigma supplied" : "# sigma estimated by StatEncode");
-    }
-    if (o.mix != Mix::None) {
-      printf("# AllGather + ReduceScatter on the same stream, %s\n",
-             o.mix == Mix::Grouped ? "one NCCL group" : "separate submissions");
-      puts("# bandwidth uses the ReduceScatter payload and the full pair duration");
-    }
+  CHECK(cudaStreamCreateWithFlags(&p.stream, cudaStreamNonBlocking));
+  CHECK(cudaMalloc(&p.send, maxCount * o.gpus * sizeof(BF)));
+  CHECK(cudaMalloc(&p.recv, maxCount * sizeof(BF)));
+  CHECK(cudaMalloc(&p.errors, sizeof(*p.errors)));
+  if (o.mix != Mix::None) CHECK(cudaMalloc(&p.gathered, maxCount * o.gpus * sizeof(BF)));
+  if (!o.native && (o.supplySigma || o.allOutliers)) CHECK(cudaMalloc(&p.sigma, sizeof(*p.sigma)));
+  generate<<<256,256,0,p.stream>>>(p.send, maxCount * o.gpus, o.seed, rank, scale, o.allOutliers, p.sigma);
+  CHECK(cudaGetLastError());
+  CHECK(cudaStreamSynchronize(p.stream));
+
+  if (rank == 0) {
+    printf("# %s BF16 Sum, %d ranks, warmup=%d iterations=%d\n",
+           o.native ? "ncclReduceScatter" : "ZipCCLReduceScatter", o.gpus, o.warmup, o.iterations);
+    if (o.mix != Mix::None)
+      printf("# AllGather + ReduceScatter (%s); bandwidth uses ReduceScatter bytes and pair time\n",
+             o.mix == Mix::Grouped ? "grouped" : "separate");
     puts("# send_bytes/GPU  recv_count/GPU  time_us  algbw_GB/s  busbw_GB/s  wrong");
     fflush(stdout);
   }
+
   bool passed = true;
   for (size_t requested = o.begin;;) {
     size_t count = requested / sizeof(BF) / o.gpus;
     size_t bytes = count * sizeof(BF) * o.gpus;
-    for (int w = 0; w < o.warmup; ++w) {
-      bool trace = shared && w == 0;
-      collective(ranks, count, o, processRank, trace);
-      if (trace) {
-        sync(ranks, processRank);
-        fprintf(stderr, "# rank %d first collective complete, recvcount=%zu\n", processRank, count);
-      }
-    }
-    sync(ranks, processRank);
-    if (shared) shared->wait();
+    for (int w = 0; w < o.warmup; ++w) collective(p, count, o);
+    CHECK(cudaStreamSynchronize(p.stream));
+    shared.wait();
+
     auto start = std::chrono::steady_clock::now();
-    for (int n = 0; n < o.iterations; ++n)
-      collective(ranks, count, o, processRank, shared && o.warmup == 0 && n == 0);
-    sync(ranks, processRank);
-    double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()/o.iterations;
-    if (shared && o.warmup == 0)
-      fprintf(stderr, "# rank %d timed collectives complete, recvcount=%zu\n", processRank, count);
+    for (int n = 0; n < o.iterations; ++n) collective(p, count, o);
+    CHECK(cudaStreamSynchronize(p.stream));
+    double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() / o.iterations;
+
     unsigned long long wrong = 0;
     if (o.validate) {
-      for (int r = 0; r < localRanks; ++r) {
-        auto& p = ranks[r];
-        int rank = shared ? processRank : r;
-        CHECK(cudaSetDevice(rank));
-        CHECK(cudaMemsetAsync(p.errors, 0, sizeof(*p.errors), p.stream));
-        verify<<<256,256,0,p.stream>>>(p.recv,count,rank,o.gpus,scale,o.seed,o.allOutliers,p.errors);
+      CHECK(cudaMemsetAsync(p.errors, 0, sizeof(*p.errors), p.stream));
+      verify<<<256,256,0,p.stream>>>(p.recv, count, rank, o.gpus, scale, o.seed, o.allOutliers, p.errors);
+      CHECK(cudaGetLastError());
+      if (p.gathered) {
+        verifyGather<<<256,256,0,p.stream>>>(p.gathered, count, o.gpus, scale, o.seed, o.allOutliers, p.errors);
         CHECK(cudaGetLastError());
-        if (p.gathered) {
-          verifyGather<<<256,256,0,p.stream>>>(p.gathered,count,o.gpus,scale,o.seed,o.allOutliers,p.errors);
-          CHECK(cudaGetLastError());
-        }
       }
-      sync(ranks, processRank);
-      for (int r = 0; r < localRanks; ++r) {
-        unsigned long long value;
-        CHECK(cudaSetDevice(shared ? processRank : r));
-        CHECK(cudaMemcpy(&value,ranks[r].errors,sizeof(value),cudaMemcpyDeviceToHost));
-        wrong += value;
-      }
+      CHECK(cudaStreamSynchronize(p.stream));
+      CHECK(cudaMemcpy(&wrong, p.errors, sizeof(wrong), cudaMemcpyDeviceToHost));
     }
-    if (shared) {
-      shared->results[processRank] = {seconds, wrong};
-      shared->wait();
-      if (report) {
-        wrong = 0;
-        for (int r = 0; r < o.gpus; ++r) {
-          seconds = std::max(seconds, shared->results[r].seconds);
-          wrong += shared->results[r].wrong;
-        }
+
+    shared.results[rank] = {seconds, wrong};
+    shared.wait();
+    if (rank == 0) {
+      wrong = 0;
+      for (int r = 0; r < o.gpus; ++r) {
+        seconds = std::max(seconds, shared.results[r].seconds);
+        wrong += shared.results[r].wrong;
       }
-    }
-    if (report) {
-      double alg = double(bytes)/seconds/1e9;
-      printf("%16zu %15zu %9.2f %11.3f %11.3f ", bytes, count, seconds*1e6, alg, alg*(o.gpus-1)/o.gpus);
+      double alg = double(bytes) / seconds / 1e9;
+      printf("%16zu %15zu %9.2f %11.3f %11.3f ", bytes, count, seconds * 1e6, alg, alg * (o.gpus - 1) / o.gpus);
       if (o.validate) printf("%llu\n", wrong);
       else puts("off");
       passed &= wrong == 0;
@@ -385,15 +321,14 @@ int run(const Options& o, int processRank = -1, SharedRun* shared = nullptr) {
     if (requested > o.end / o.factor) break;
     requested *= o.factor;
   }
-  for (int r = 0; r < localRanks; ++r) {
-    CHECK(cudaSetDevice(shared ? processRank : r));
-    auto& p = ranks[r];
-    CHECK(ncclCommDestroy(p.comm));
-    if (p.gathered) CHECK(cudaFree(p.gathered));
-    if (p.sigma) CHECK(cudaFree(p.sigma));
-    CHECK(cudaFree(p.errors)); CHECK(cudaFree(p.recv)); CHECK(cudaFree(p.send));
-    CHECK(cudaStreamDestroy(p.stream));
-  }
+
+  CHECK(ncclCommDestroy(p.comm));
+  if (p.gathered) CHECK(cudaFree(p.gathered));
+  if (p.sigma) CHECK(cudaFree(p.sigma));
+  CHECK(cudaFree(p.errors));
+  CHECK(cudaFree(p.recv));
+  CHECK(cudaFree(p.send));
+  CHECK(cudaStreamDestroy(p.stream));
   return passed ? 0 : 2;
 }
 
@@ -425,7 +360,7 @@ int runProcesses(const Options& o) {
     if (child == 0) {
       if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent) _exit(1);
       try {
-        _exit(run(o, rank, shared));
+        _exit(runRank(o, rank, *shared));
       } catch (const std::exception& e) {
         fprintf(stderr, "rank %d: %s\n", rank, e.what());
         _exit(1);
@@ -473,8 +408,7 @@ int runProcesses(const Options& o) {
 
 int main(int argc, char** argv) {
   try {
-    auto options = parse(argc, argv);
-    return options.multiProcess ? runProcesses(options) : run(options);
+    return runProcesses(parse(argc, argv));
   } catch (const std::exception& e) {
     fprintf(stderr, "error: %s\n", e.what());
     return 1;

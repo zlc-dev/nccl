@@ -54,7 +54,7 @@ struct shmRequest {
 #define SHM_SEND_SIDE 1
 #define SHM_RECV_SIDE 2
 NCCL_PARAM(ShmDisable, "SHM_DISABLE", 0);
-NCCL_PARAM(ZipShmGpuStage, "ZIP_SHM_GPU_STAGE", 0);
+NCCL_PARAM(ZipShmGpuStage, "ZIP_SHM_GPU_STAGE", 1);
 NCCL_PARAM(ShmLocality, "SHM_LOCALITY", SHM_RECV_SIDE); // 1 is sender-size, 2 is receiver-size
 static int shmLocality = 0;
 static void initShmLocality();
